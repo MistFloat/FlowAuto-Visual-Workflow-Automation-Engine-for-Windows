@@ -30,6 +30,10 @@ public partial class MainForm : Form
     private Button _btnColorPicker = null!;
     private Button _btnKeyPicker = null!;
     private Button _btnSettings = null!;
+    private Button _btnArrange = null!;
+    private Button _btnExample = null!;
+    private readonly ToolTip _toolTip = new();
+    private bool _isDirty;
 
     // Global settings
     private int _globalPreDelayMs = 500;
@@ -44,10 +48,14 @@ public partial class MainForm : Form
         Text = "FlowAuto - Visual Workflow Automation Engine";
         Size = new Size(1400, 900);
         StartPosition = FormStartPosition.CenterScreen;
-        BackColor = Color.FromArgb(30, 30, 35);
+        MinimumSize = new Size(1050, 680);
+        BackColor = AppTheme.Window;
+        Font = new Font("Segoe UI", 9);
         KeyPreview = true;
 
         InitializeComponents();
+        UpdateWindowTitle();
+        FormClosing += OnMainFormClosing;
     }
 
     private void InitializeComponents()
@@ -59,30 +67,32 @@ public partial class MainForm : Form
         _statusLabel = new Label
         {
             Text = "Ready",
-            ForeColor = Color.FromArgb(180, 180, 180),
-            BackColor = Color.FromArgb(20, 20, 25),
+            ForeColor = AppTheme.TextMuted,
+            BackColor = AppTheme.Surface,
             Dock = DockStyle.Bottom,
-            Height = 24,
+            Height = 28,
             TextAlign = ContentAlignment.MiddleLeft,
-            Padding = new Padding(8, 0, 0, 0)
+            Padding = new Padding(12, 0, 0, 0)
         };
 
         // Main split container
         _mainSplit = new SplitContainer
         {
             Dock = DockStyle.Fill,
-            SplitterWidth = 3,
-            BackColor = Color.FromArgb(45, 45, 50)
+            SplitterWidth = 5,
+            BackColor = AppTheme.Border
         };
 
         // Left: Toolbox
         var toolboxContainer = new Panel { Dock = DockStyle.Fill };
         _toolbox = new ToolboxPanel();
+        _toolbox.ToolActivated += type => _canvas.AddNode(FlowCanvas.CreateDefaultNode(type));
         toolboxContainer.Controls.Add(_toolbox);
 
         // Center: Canvas
         _canvas = new FlowCanvas { Dock = DockStyle.Fill };
         _canvas.NodesChanged += OnCanvasChanged;
+        _canvas.ConnectionsChanged += OnCanvasChanged;
         _canvas.NodeSelected += OnNodeSelected;
         _canvas.SelectionCleared += () => _propertyPanel.ShowNode(null);
 
@@ -91,49 +101,39 @@ public partial class MainForm : Form
         {
             Dock = DockStyle.Fill,
             Orientation = Orientation.Horizontal,
-            SplitterWidth = 3,
-            BackColor = Color.FromArgb(45, 45, 50)
+            SplitterWidth = 5,
+            BackColor = AppTheme.Border
         };
 
         // Right-top: Property panel
         _propertyPanel = new PropertyPanel();
-        var propContainer = new Panel { Dock = DockStyle.Fill };
-        var propHeader = new Label
+        _propertyPanel.ValueChanged += () =>
         {
-            Text = "Properties",
-            Font = new Font("Segoe UI", 11, FontStyle.Bold),
-            ForeColor = Color.White,
-            BackColor = Color.FromArgb(37, 37, 42),
-            Dock = DockStyle.Top,
-            Height = 28,
-            TextAlign = ContentAlignment.MiddleLeft,
-            Padding = new Padding(8, 0, 0, 0)
+            _isDirty = true;
+            UpdateWindowTitle();
+            _canvas.Invalidate();
         };
-        propContainer.Controls.Add(propHeader);
+        var propContainer = new Panel { Dock = DockStyle.Fill };
+        var propHeader = CreateSectionHeader("PROPERTIES");
         propContainer.Controls.Add(_propertyPanel);
+        propContainer.Controls.Add(propHeader);
 
         // Right-bottom: Log
         _logBox = new RichTextBox
         {
             Dock = DockStyle.Fill,
-            BackColor = Color.FromArgb(20, 20, 25),
-            ForeColor = Color.FromArgb(200, 200, 200),
+            BackColor = AppTheme.Canvas,
+            ForeColor = Color.FromArgb(205, 214, 230),
             Font = new Font("Consolas", 9),
             ReadOnly = true,
-            WordWrap = false
+            WordWrap = false,
+            BorderStyle = BorderStyle.None,
+            Padding = new Padding(8)
         };
         var logContainer = new Panel { Dock = DockStyle.Fill };
-        var logHeader = new Label
-        {
-            Text = "Execution Log",
-            Font = new Font("Segoe UI", 11, FontStyle.Bold),
-            ForeColor = Color.White,
-            BackColor = Color.FromArgb(37, 37, 42),
-            Dock = DockStyle.Top,
-            Height = 28,
-            TextAlign = ContentAlignment.MiddleLeft,
-            Padding = new Padding(8, 0, 0, 0)
-        };
+        var logHeader = CreateSectionHeader("EXECUTION LOG",
+            ("Copy", () => { if (_logBox.TextLength > 0) Clipboard.SetText(_logBox.Text); }),
+            ("Clear", () => _logBox.Clear()));
         logContainer.Controls.Add(_logBox);
         logContainer.Controls.Add(logHeader);
 
@@ -152,8 +152,8 @@ public partial class MainForm : Form
             ColumnCount = 2,
             RowCount = 1
         };
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 65));
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 35));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 70));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 30));
 
         layout.Controls.Add(_mainSplit, 0, 0);
         layout.Controls.Add(_rightSplit, 1, 0);
@@ -174,11 +174,11 @@ public partial class MainForm : Form
         {
             _mainSplit.Panel1MinSize = 150;
             _mainSplit.Panel2MinSize = 250;
-            _mainSplit.SplitterDistance = Math.Min(280, _mainSplit.Width - _mainSplit.Panel2MinSize - 10);
+            _mainSplit.SplitterDistance = Math.Min(250, _mainSplit.Width - _mainSplit.Panel2MinSize - 10);
 
             _rightSplit.Panel1MinSize = 100;
             _rightSplit.Panel2MinSize = 100;
-            _rightSplit.SplitterDistance = Math.Min(350, _rightSplit.Height - _rightSplit.Panel2MinSize - 10);
+            _rightSplit.SplitterDistance = Math.Min(430, _rightSplit.Height - _rightSplit.Panel2MinSize - 10);
         };
 
         // Start with empty canvas
@@ -188,74 +188,153 @@ public partial class MainForm : Form
 
     protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
     {
-        // Ctrl+S: Stop execution
+        if (keyData == (Keys.Control | Keys.N)) { NewFlow(); return true; }
+        if (keyData == (Keys.Control | Keys.O)) { LoadFlow(); return true; }
+        if (keyData == (Keys.Control | Keys.Shift | Keys.S)) { SaveFlow(saveAs: true); return true; }
         if (keyData == (Keys.Control | Keys.S))
         {
-            if (_execContext?.Cts != null && !_execContext.Cts.IsCancellationRequested)
-            {
-                StopFlow();
-                return true;
-            }
+            SaveFlow();
+            return true;
         }
+        if (keyData == Keys.F5 && _btnRun.Enabled) { RunFlow(); return true; }
+        if (keyData == (Keys.Shift | Keys.F5) && _btnStop.Enabled) { StopFlow(); return true; }
+        if (keyData == (Keys.Control | Keys.L)) { _logBox.Clear(); return true; }
 
         return base.ProcessCmdKey(ref msg, keyData);
     }
 
-    private Panel CreateToolbar()
+    private Control CreateToolbar()
     {
-        var toolbar = new Panel
+        var toolbar = new FlowLayoutPanel
         {
-            Height = 40,
-            BackColor = Color.FromArgb(44, 44, 49)
+            Height = 58,
+            BackColor = AppTheme.Surface,
+            Padding = new Padding(12, 10, 8, 8),
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            AutoScroll = true
         };
 
-        int x = 8;
-        _btnNew = CreateToolButton("New", x, () => NewFlow()); x += 52;
-        _btnLoad = CreateToolButton("Load", x, () => LoadFlow(), width: 60); x += 66;
-        _btnSave = CreateToolButton("Save", x, () => SaveFlow()); x += 52;
-        x += 12;
-        _btnRun = CreateToolButton("Run", x, () => RunFlow(), Color.FromArgb(52, 168, 83)); x += 52;
-        _btnPause = CreateToolButton("Pause", x, () => PauseFlow(), Color.FromArgb(251, 188, 4)); x += 52;
-        _btnStop = CreateToolButton("Stop", x, () => StopFlow(), Color.FromArgb(233, 30, 99)); x += 52;
-        x += 12;
-        _btnScreenshot = CreateToolButton("Snip", x, OpenScreenshotTool); x += 52;
-        _btnWindowPicker = CreateToolButton("Pick Win", x, OpenWindowPicker, width: 72); x += 78;
-        _btnRegionPicker = CreateToolButton("Pick Rgn", x, OpenRegionPicker, width: 72); x += 78;
-        _btnColorPicker = CreateToolButton("Pick Color", x, OpenColorPicker, width: 78, color: Color.FromArgb(156, 39, 176)); x += 84;
-        _btnKeyPicker = CreateToolButton("Pick Key", x, OpenKeyPicker, width: 72, color: Color.FromArgb(33, 150, 243)); x += 78;
-        x += 12;
-        _btnSettings = CreateToolButton("Settings", x, OpenGlobalSettings, width: 72); x += 78;
+        _btnNew = CreateToolButton("New", () => NewFlow(), "New flow (Ctrl+N)");
+        _btnLoad = CreateToolButton("Open", () => LoadFlow(), "Open flow (Ctrl+O)");
+        _btnSave = CreateToolButton("Save", () => SaveFlow(), "Save flow (Ctrl+S)");
+        _btnRun = CreateToolButton("▶ Run", () => RunFlow(), "Run flow (F5)", AppTheme.Success, 72);
+        _btnPause = CreateToolButton("Ⅱ Pause", () => PauseFlow(), "Pause or resume", AppTheme.Warning, 78);
+        _btnStop = CreateToolButton("■ Stop", () => StopFlow(), "Stop flow (Shift+F5)", AppTheme.Danger, 72);
+        _btnArrange = CreateToolButton("Arrange", ArrangeCanvas, "Automatically arrange nodes", AppTheme.Accent, 74);
+        _btnExample = CreateToolButton("Example", CreateExampleFlow, "Create a starter flow", width: 72);
+        _btnScreenshot = CreateToolButton("Snip", OpenScreenshotTool, "Capture a screen region");
+        _btnWindowPicker = CreateToolButton("Window", OpenWindowPicker, "Pick a target window", width: 68);
+        _btnRegionPicker = CreateToolButton("Region", OpenRegionPicker, "Pick a window region", width: 66);
+        _btnColorPicker = CreateToolButton("Color", OpenColorPicker, "Pick a target color", Color.FromArgb(166, 95, 215), 62);
+        _btnKeyPicker = CreateToolButton("Key", OpenKeyPicker, "Capture a key", Color.FromArgb(54, 130, 220), 54);
+        _btnSettings = CreateToolButton("Settings", OpenGlobalSettings, "Global delays", width: 72);
 
         toolbar.Controls.AddRange([
-            _btnNew, _btnLoad, _btnSave, _btnRun, _btnPause, _btnStop, _btnScreenshot, _btnWindowPicker, _btnRegionPicker, _btnColorPicker, _btnKeyPicker, _btnSettings
+            _btnNew, _btnLoad, _btnSave, CreateSeparator(),
+            _btnRun, _btnPause, _btnStop, CreateSeparator(),
+            _btnArrange, _btnExample, CreateSeparator(),
+            _btnScreenshot, _btnWindowPicker, _btnRegionPicker, _btnColorPicker, _btnKeyPicker, _btnSettings
         ]);
 
         return toolbar;
     }
 
-    private Button CreateToolButton(string text, int x, Action action, Color? color = null, int width = 46)
+    private Button CreateToolButton(string text, Action action, string tooltip, Color? color = null, int width = 58)
     {
         var btn = new Button
         {
             Text = text,
-            Location = new Point(x, 6),
-            Size = new Size(width, 28),
-            FlatStyle = FlatStyle.Flat,
-            BackColor = color ?? Color.FromArgb(60, 60, 65),
-            ForeColor = Color.White,
-            Font = new Font("Segoe UI", 8),
-            Cursor = Cursors.Hand
+            Size = new Size(width, 34),
+            Margin = new Padding(0, 0, 6, 0)
         };
-        btn.FlatAppearance.BorderSize = 0;
+        AppTheme.StyleButton(btn, color);
         btn.Click += (s, e) => action();
+        _toolTip.SetToolTip(btn, tooltip);
         return btn;
+    }
+
+    private static Control CreateSeparator() => new Panel
+    {
+        Size = new Size(1, 26),
+        Margin = new Padding(5, 4, 11, 0),
+        BackColor = AppTheme.Border
+    };
+
+    private static Panel CreateSectionHeader(string title, params (string Text, Action Action)[] actions)
+    {
+        var panel = new Panel { Dock = DockStyle.Top, Height = 38, BackColor = AppTheme.SurfaceRaised };
+        var label = new Label
+        {
+            Text = title,
+            Dock = DockStyle.Fill,
+            Padding = new Padding(12, 0, 0, 0),
+            TextAlign = ContentAlignment.MiddleLeft,
+            ForeColor = AppTheme.TextMuted,
+            Font = new Font("Segoe UI Semibold", 9)
+        };
+        panel.Controls.Add(label);
+        foreach (var action in actions.Reverse())
+        {
+            var button = new Button { Text = action.Text, Dock = DockStyle.Right, Width = 52 };
+            AppTheme.StyleButton(button);
+            button.FlatAppearance.BorderSize = 0;
+            button.Click += (_, _) => action.Action();
+            panel.Controls.Add(button);
+        }
+        return panel;
     }
 
     // ============ Canvas events ============
 
     private void OnCanvasChanged()
     {
-        _statusLabel.Text = $"Nodes: {_canvas.Nodes.Count}";
+        _isDirty = true;
+        UpdateWindowTitle();
+        _statusLabel.Text = $"  {_canvas.Nodes.Count} nodes   •   {_canvas.Connections.Count} connections";
+    }
+
+    private void UpdateWindowTitle()
+    {
+        var name = string.IsNullOrEmpty(_currentFilePath) ? "Untitled" : Path.GetFileName(_currentFilePath);
+        Text = $"{(_isDirty ? "● " : "")}FlowAuto  —  {name}";
+    }
+
+    private void ArrangeCanvas()
+    {
+        _canvas.AutoLayout();
+        _statusLabel.Text = "Canvas arranged automatically";
+    }
+
+    private void OnMainFormClosing(object? sender, FormClosingEventArgs e)
+    {
+        if (_isDirty)
+        {
+            var result = MessageBox.Show("Save changes before closing?", "Unsaved Flow",
+                MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+            if (result == DialogResult.Cancel)
+            {
+                e.Cancel = true;
+                return;
+            }
+            if (result == DialogResult.Yes)
+            {
+                SaveFlow();
+                e.Cancel = _isDirty; // Save dialog was cancelled or saving failed.
+            }
+        }
+
+        if (e.Cancel) return;
+
+        // A background flow and a global keyboard hook can otherwise outlive
+        // the UI controls they call into during shutdown.
+        _execContext?.Cts?.Cancel();
+        if (_execContext?.IsPaused == true)
+        {
+            _execContext.IsPaused = false;
+            _execContext.PauseTcs?.TrySetResult(false);
+        }
+        RemoveKeyHook();
     }
 
     private void OnNodeSelected(int index)
@@ -270,16 +349,19 @@ public partial class MainForm : Form
 
     private void NewFlow()
     {
-        if (_canvas.Nodes.Count > 0)
-        {
-            var result = MessageBox.Show("Clear current flow?", "New Flow", MessageBoxButtons.YesNo);
-            if (result != DialogResult.No)
-                _canvas.ClearNodes();
-        }
+        if (!ConfirmDiscardChanges("create a new flow")) return;
+
+        _canvas.ClearNodes();
+        _currentFilePath = "";
+        _isDirty = false;
+        UpdateWindowTitle();
+        _statusLabel.Text = "New flow";
     }
 
     private void LoadFlow()
     {
+        if (!ConfirmDiscardChanges("load another flow")) return;
+
         using var dlg = new OpenFileDialog
         {
             Filter = "Flow Files|*.flow.json|All Files|*.*",
@@ -291,7 +373,14 @@ public partial class MainForm : Form
         {
             var json = File.ReadAllText(dlg.FileName);
             var flow = JsonSerializer.Deserialize<FlowDefinition>(json);
-            if (flow == null) return;
+            var validationErrors = FlowValidator.Validate(flow);
+            if (validationErrors.Count > 0)
+            {
+                MessageBox.Show(string.Join(Environment.NewLine, validationErrors), "Invalid Flow",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            if (flow == null) return; // Guaranteed by validation; keeps nullable analysis explicit.
 
             _canvas.ClearNodes();
             foreach (var node in flow.Nodes)
@@ -310,6 +399,8 @@ public partial class MainForm : Form
             }
             _canvas.Invalidate();
             _currentFilePath = dlg.FileName;
+            _isDirty = false;
+            UpdateWindowTitle();
             _statusLabel.Text = $"Loaded: {Path.GetFileName(dlg.FileName)}";
             _logger.Info("SYSTEM", $"Loaded flow: {flow.FlowName}");
         }
@@ -317,6 +408,20 @@ public partial class MainForm : Form
         {
             MessageBox.Show($"Failed to load: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
+    }
+
+    private bool ConfirmDiscardChanges(string action)
+    {
+        if (!_isDirty) return true;
+
+        var result = MessageBox.Show(
+            $"Save changes before you {action}?", "Unsaved Flow",
+            MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+        if (result == DialogResult.Cancel) return false;
+        if (result != DialogResult.Yes) return true;
+
+        SaveFlow();
+        return !_isDirty;
     }
 
     private void AutoConnectNodes()
@@ -337,24 +442,40 @@ public partial class MainForm : Form
         }
     }
 
-    private void SaveFlow()
+    private void SaveFlow(bool saveAs = false)
     {
-        using var dlg = new SaveFileDialog
+        var targetPath = _currentFilePath;
+        if (saveAs || string.IsNullOrEmpty(targetPath))
         {
-            Filter = "Flow Files|*.flow.json|All Files|*.*",
-            Title = "Save Flow",
-            DefaultExt = ".flow.json",
-            FileName = string.IsNullOrEmpty(_currentFilePath) ? "unnamed.flow.json" : Path.GetFileName(_currentFilePath)
-        };
-        if (dlg.ShowDialog() != DialogResult.OK) return;
+            using var dlg = new SaveFileDialog
+            {
+                Filter = "Flow Files|*.flow.json|All Files|*.*",
+                Title = "Save Flow",
+                DefaultExt = ".flow.json",
+                FileName = string.IsNullOrEmpty(_currentFilePath) ? "unnamed.flow.json" : Path.GetFileName(_currentFilePath)
+            };
+            if (dlg.ShowDialog() != DialogResult.OK) return;
+            targetPath = dlg.FileName;
+        }
 
         try
         {
             var flow = GetFlowDefinition();
             var json = JsonSerializer.Serialize(flow, new JsonSerializerOptions { WriteIndented = true });
-            File.WriteAllText(dlg.FileName, json);
-            _currentFilePath = dlg.FileName;
-            _statusLabel.Text = $"Saved: {Path.GetFileName(dlg.FileName)}";
+            var tempPath = $"{targetPath}.{Guid.NewGuid():N}.tmp";
+            try
+            {
+                File.WriteAllText(tempPath, json);
+                File.Move(tempPath, targetPath, true);
+            }
+            finally
+            {
+                if (File.Exists(tempPath)) File.Delete(tempPath);
+            }
+            _currentFilePath = targetPath;
+            _isDirty = false;
+            UpdateWindowTitle();
+            _statusLabel.Text = $"Saved: {Path.GetFileName(targetPath)}";
             _logger.Info("SYSTEM", $"Saved flow: {flow.FlowName}");
         }
         catch (Exception ex)
@@ -365,9 +486,12 @@ public partial class MainForm : Form
 
     public FlowDefinition GetFlowDefinition()
     {
+        var flowName = string.IsNullOrEmpty(_currentFilePath)
+            ? "Untitled Flow"
+            : Path.GetFileNameWithoutExtension(_currentFilePath);
         return new FlowDefinition
         {
-            FlowName = Path.GetFileNameWithoutExtension(_currentFilePath) ?? "Unnamed Flow",
+            FlowName = flowName,
             Nodes = _canvas.Nodes.ToList(),
             Connections = _canvas.Connections.ToList()
         };
@@ -378,6 +502,13 @@ public partial class MainForm : Form
     private async void RunFlow()
     {
         var flow = GetFlowDefinition();
+        var validationErrors = FlowValidator.Validate(flow);
+        if (validationErrors.Count > 0)
+        {
+            MessageBox.Show(string.Join(Environment.NewLine, validationErrors), "Invalid Flow",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
         if (flow.Nodes.Count == 0)
         {
             MessageBox.Show("No nodes to execute.", "Info");
@@ -415,7 +546,10 @@ public partial class MainForm : Form
         }
         finally
         {
-            SetExecutionButtons(running: false);
+            _execContext?.Cts?.Dispose();
+            if (_execContext != null) _execContext.Cts = null;
+            if (!IsDisposed && !Disposing)
+                SetExecutionButtons(running: false);
         }
     }
 
@@ -426,9 +560,10 @@ public partial class MainForm : Form
         if (!_execContext.IsPaused)
         {
             _execContext.IsPaused = true;
-            _execContext.PauseTcs = new TaskCompletionSource<bool>();
+            _execContext.PauseTcs = new TaskCompletionSource<bool>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
             _btnPause.Text = "Resume";
-            _btnPause.BackColor = Color.FromArgb(52, 168, 83);
+            _btnPause.BackColor = AppTheme.Success;
             _statusLabel.Text = "PAUSED";
         }
         else
@@ -436,7 +571,7 @@ public partial class MainForm : Form
             _execContext.IsPaused = false;
             _execContext.PauseTcs?.TrySetResult(true);
             _btnPause.Text = "Pause";
-            _btnPause.BackColor = Color.FromArgb(251, 188, 4);
+            _btnPause.BackColor = AppTheme.Warning;
             _statusLabel.Text = "Running...";
         }
     }
@@ -449,8 +584,9 @@ public partial class MainForm : Form
             _execContext.IsPaused = false;
             _execContext.PauseTcs?.TrySetResult(false);
         }
-        SetExecutionButtons(running: false);
-        _statusLabel.Text = "Stopped";
+        // Keep Run disabled until the executor has actually unwound. Starting a
+        // second flow here could otherwise overlap with an action still stopping.
+        _statusLabel.Text = "Stopping...";
         _logger.Info("SYSTEM", "Stopping...");
     }
 
@@ -460,7 +596,7 @@ public partial class MainForm : Form
         _btnPause.Enabled = running;
         _btnStop.Enabled = running;
         _btnPause.Text = "Pause";
-        _btnPause.BackColor = Color.FromArgb(251, 188, 4);
+        _btnPause.BackColor = AppTheme.Warning;
 
         if (running)
             _statusLabel.Text = "Running...";
@@ -738,6 +874,11 @@ public partial class MainForm : Form
 
     private void CreateExampleFlow()
     {
+        if (_canvas.Nodes.Count > 0 && MessageBox.Show("Replace the current flow with an example?", "Example Flow",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+            return;
+
+        _canvas.ClearNodes();
         var flow = new FlowDefinition
         {
             FlowName = "Example: Launch & Click",
@@ -755,6 +896,7 @@ public partial class MainForm : Form
             _canvas.Nodes.Add(node);
         }
         AutoConnectNodes();
+        _canvas.AutoLayout();
         OnCanvasChanged();
     }
 
@@ -793,11 +935,7 @@ public partial class MainForm : Form
 
     private void OpenKeyPicker()
     {
-        if (_keyHookId != IntPtr.Zero)
-        {
-            UnhookWindowsHookEx(_keyHookId);
-            _keyHookId = IntPtr.Zero;
-        }
+        RemoveKeyHook();
 
         _keyHookProc = KeyHookCallback;
         _keyHookId = SetWindowsHookEx(WH_KEYBOARD_LL, _keyHookProc, GetModuleHandle(null), 0);
@@ -810,6 +948,16 @@ public partial class MainForm : Form
 
         _statusLabel.Text = "Press any key to capture its scan code...";
         _logger.Info("SYSTEM", "Key picker active — press any key...");
+    }
+
+    private void RemoveKeyHook()
+    {
+        if (_keyHookId != IntPtr.Zero)
+        {
+            UnhookWindowsHookEx(_keyHookId);
+            _keyHookId = IntPtr.Zero;
+        }
+        _keyHookProc = null;
     }
 
     private IntPtr KeyHookCallback(int nCode, IntPtr wParam, IntPtr lParam)

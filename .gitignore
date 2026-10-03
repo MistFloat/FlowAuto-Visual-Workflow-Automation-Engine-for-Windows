@@ -25,6 +25,7 @@ x86/
 publish*/
 flowauto_v*/
 selfcontainedpublish/
+artifacts/
 
 # Temporary/unnamed files
 unnamed*.flow.json

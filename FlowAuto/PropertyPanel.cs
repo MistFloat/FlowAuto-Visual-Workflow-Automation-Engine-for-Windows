@@ -13,18 +13,20 @@ public class PropertyPanel : Panel
     private int _currentRow;
 
     public FlowNode? CurrentNode => _currentNode;
+    public event Action? ValueChanged;
 
     public PropertyPanel()
     {
         Dock = DockStyle.Fill;
-        BackColor = Color.FromArgb(37, 37, 42);
+        BackColor = AppTheme.Surface;
 
         _table = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
             ColumnCount = 2,
             AutoScroll = true,
-            Padding = new Padding(8)
+            Padding = new Padding(12),
+            BackColor = AppTheme.Surface
         };
         _table.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 110));
         _table.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -107,6 +109,7 @@ public class PropertyPanel : Panel
             Cursor = Cursors.Hand,
             Dock = DockStyle.Fill
         };
+        AppTheme.StyleButton(helpBtn, AppTheme.Accent);
         helpBtn.FlatAppearance.BorderSize = 0;
         helpBtn.Click += (s, e) =>
         {
@@ -125,7 +128,7 @@ public class PropertyPanel : Panel
         {
             Text = $"Properties: {node.NodeType}",
             Font = new Font("Segoe UI", 10, FontStyle.Bold),
-            ForeColor = Color.White,
+            ForeColor = AppTheme.Text,
             AutoSize = true
         };
         _table.Controls.Add(titleLabel, 0, _currentRow);
@@ -139,7 +142,7 @@ public class PropertyPanel : Panel
         var label = new Label
         {
             Text = "Select a node to view properties",
-            ForeColor = Color.FromArgb(150, 150, 150),
+            ForeColor = AppTheme.TextMuted,
             AutoSize = true
         };
         _table.Controls.Add(label, 0, 0);
@@ -156,11 +159,11 @@ public class PropertyPanel : Panel
         {
             Text = value,
             Dock = DockStyle.Fill,
-            BackColor = Color.FromArgb(50, 50, 55),
-            ForeColor = Color.White,
+            BackColor = AppTheme.SurfaceRaised,
+            ForeColor = AppTheme.Text,
             BorderStyle = BorderStyle.FixedSingle
         };
-        tb.TextChanged += (s, e) => { if (!_rebuilding) setter(tb.Text); };
+        tb.TextChanged += (s, e) => { if (!_rebuilding) { setter(tb.Text); ValueChanged?.Invoke(); } };
         _table.Controls.Add(tb, 1, _currentRow);
         _controls[key] = tb;
         _table.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
@@ -176,12 +179,12 @@ public class PropertyPanel : Panel
             Maximum = 999999,
             Value = value,
             Dock = DockStyle.Fill,
-            BackColor = Color.FromArgb(50, 50, 55),
-            ForeColor = Color.White,
+            BackColor = AppTheme.SurfaceRaised,
+            ForeColor = AppTheme.Text,
             BorderStyle = BorderStyle.FixedSingle
         };
         // Register handler AFTER initial Value is set to avoid recursive ShowNode during build
-        nud.ValueChanged += (s, e) => { if (!_rebuilding) setter((int)nud.Value); };
+        nud.ValueChanged += (s, e) => { if (!_rebuilding) { setter((int)nud.Value); ValueChanged?.Invoke(); } };
         _table.Controls.Add(nud, 1, _currentRow);
         _controls[key] = nud;
         _table.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
@@ -199,12 +202,12 @@ public class PropertyPanel : Panel
             Increment = 0.1m,
             Value = (decimal)value,
             Dock = DockStyle.Fill,
-            BackColor = Color.FromArgb(50, 50, 55),
-            ForeColor = Color.White,
+            BackColor = AppTheme.SurfaceRaised,
+            ForeColor = AppTheme.Text,
             BorderStyle = BorderStyle.FixedSingle
         };
         // Register handler AFTER initial Value is set to avoid recursive ShowNode during build
-        nud.ValueChanged += (s, e) => { if (!_rebuilding) setter((double)nud.Value); };
+        nud.ValueChanged += (s, e) => { if (!_rebuilding) { setter((double)nud.Value); ValueChanged?.Invoke(); } };
         _table.Controls.Add(nud, 1, _currentRow);
         _controls[key] = nud;
         _table.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
@@ -217,10 +220,10 @@ public class PropertyPanel : Panel
         var cb = new CheckBox
         {
             Checked = value,
-            ForeColor = Color.White,
+            ForeColor = AppTheme.Text,
             BackColor = Color.Transparent
         };
-        cb.CheckedChanged += (s, e) => { if (!_rebuilding) setter(cb.Checked); };
+        cb.CheckedChanged += (s, e) => { if (!_rebuilding) { setter(cb.Checked); ValueChanged?.Invoke(); } };
         _table.Controls.Add(cb, 1, _currentRow);
         _controls[key] = cb;
         _table.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
@@ -233,14 +236,14 @@ public class PropertyPanel : Panel
         var cb = new ComboBox
         {
             Dock = DockStyle.Fill,
-            BackColor = Color.FromArgb(50, 50, 55),
-            ForeColor = Color.White,
+            BackColor = AppTheme.SurfaceRaised,
+            ForeColor = AppTheme.Text,
             DropDownStyle = ComboBoxStyle.DropDownList,
             FlatStyle = FlatStyle.Flat
         };
         cb.Items.AddRange(items);
         cb.SelectedItem = value;
-        cb.SelectedIndexChanged += (s, e) => { if (!_rebuilding) setter(cb.SelectedItem?.ToString() ?? ""); };
+        cb.SelectedIndexChanged += (s, e) => { if (!_rebuilding) { setter(cb.SelectedItem?.ToString() ?? ""); ValueChanged?.Invoke(); } };
         _table.Controls.Add(cb, 1, _currentRow);
         _controls[key] = cb;
         _table.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
@@ -259,16 +262,16 @@ public class PropertyPanel : Panel
             Height = 22,
             Dock = DockStyle.Right,
             FlatStyle = FlatStyle.Flat,
-            BackColor = Color.FromArgb(60, 60, 65),
-            ForeColor = Color.White
+            BackColor = AppTheme.SurfaceRaised,
+            ForeColor = AppTheme.Text
         };
 
         var tb = new TextBox
         {
             Text = value,
             Dock = DockStyle.Fill,
-            BackColor = Color.FromArgb(50, 50, 55),
-            ForeColor = Color.White,
+            BackColor = AppTheme.SurfaceRaised,
+            ForeColor = AppTheme.Text,
             BorderStyle = BorderStyle.FixedSingle
         };
 
@@ -278,11 +281,10 @@ public class PropertyPanel : Panel
             if (dlg.ShowDialog() == DialogResult.OK)
             {
                 tb.Text = dlg.FileName;
-                setter(dlg.FileName);
             }
         };
 
-        tb.TextChanged += (s, e) => { if (!_rebuilding) setter(tb.Text); };
+        tb.TextChanged += (s, e) => { if (!_rebuilding) { setter(tb.Text); ValueChanged?.Invoke(); } };
 
         // Button must be added first so Dock.Right takes priority over Dock.Fill
         panel.Controls.Add(btn);
@@ -303,10 +305,10 @@ public class PropertyPanel : Panel
         var nudW = new NumericUpDown { Minimum = 0, Maximum = 99999, Value = value.Width, Width = 55, Location = new Point(0, 28), BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White };
         var nudH = new NumericUpDown { Minimum = 0, Maximum = 99999, Value = value.Height, Width = 55, Location = new Point(60, 28), BackColor = Color.FromArgb(50, 50, 55), ForeColor = Color.White };
         panel.Controls.AddRange([nudX, nudY, nudW, nudH]);
-        nudX.ValueChanged += (s, e) => { value.X = (int)nudX.Value; };
-        nudY.ValueChanged += (s, e) => { value.Y = (int)nudY.Value; };
-        nudW.ValueChanged += (s, e) => { value.Width = (int)nudW.Value; };
-        nudH.ValueChanged += (s, e) => { value.Height = (int)nudH.Value; };
+        nudX.ValueChanged += (s, e) => { value.X = (int)nudX.Value; ValueChanged?.Invoke(); };
+        nudY.ValueChanged += (s, e) => { value.Y = (int)nudY.Value; ValueChanged?.Invoke(); };
+        nudW.ValueChanged += (s, e) => { value.Width = (int)nudW.Value; ValueChanged?.Invoke(); };
+        nudH.ValueChanged += (s, e) => { value.Height = (int)nudH.Value; ValueChanged?.Invoke(); };
         _table.Controls.Add(panel, 1, _currentRow);
         _controls[key] = panel;
         _table.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
@@ -318,7 +320,7 @@ public class PropertyPanel : Panel
         var label = new Label
         {
             Text = text,
-            ForeColor = Color.FromArgb(200, 200, 200),
+            ForeColor = AppTheme.TextMuted,
             AutoSize = false,
             AutoEllipsis = true,
             TextAlign = ContentAlignment.MiddleLeft,
@@ -338,7 +340,7 @@ public class PropertyPanel : Panel
         {
             Text = text,
             Font = new Font("Segoe UI", 8, FontStyle.Italic),
-            ForeColor = Color.FromArgb(140, 160, 180),
+            ForeColor = AppTheme.TextMuted,
             AutoSize = false,
             AutoEllipsis = true,
             TextAlign = ContentAlignment.MiddleLeft,
@@ -357,7 +359,7 @@ public class PropertyPanel : Panel
         {
             Text = text,
             Font = new Font("Segoe UI", 9, FontStyle.Bold),
-            ForeColor = Color.FromArgb(86, 156, 214),
+            ForeColor = AppTheme.Accent,
             AutoSize = true,
             Margin = new Padding(0, 4, 0, 0)
         };
@@ -405,6 +407,7 @@ public class PropertyPanel : Panel
             preview.BackColor = c;
             // Store as simple string (Color objects don't survive JSON round-trip)
             node.SetParam(key, $"{c.R},{c.G},{c.B}");
+            ValueChanged?.Invoke();
         };
 
         nudR.ValueChanged += (s, e) => updateColor();
@@ -425,7 +428,7 @@ public class PropertyPanel : Panel
         {
             Text = "",
             Height = 1,
-            BackColor = Color.FromArgb(60, 60, 65),
+            BackColor = AppTheme.Border,
             Dock = DockStyle.Top
         };
         _table.Controls.Add(sep, 0, _currentRow);

@@ -89,6 +89,29 @@ public static class InputSimulator
         if (postDelayMs > 0) Thread.Sleep(postDelayMs);
     }
 
+    public static async Task MoveAndClickAsync(
+        int screenX, int screenY, int preDelayMs = 100, int postDelayMs = 500,
+        CancellationToken cancellationToken = default)
+    {
+        Cursor.Position = new Point(screenX, screenY);
+        if (preDelayMs > 0)
+            await Task.Delay(preDelayMs, cancellationToken);
+
+        mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, UIntPtr.Zero);
+        try
+        {
+            await Task.Delay(50, cancellationToken);
+        }
+        finally
+        {
+            // Never leave the mouse button held if a stop/timeout arrives.
+            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, UIntPtr.Zero);
+        }
+
+        if (postDelayMs > 0)
+            await Task.Delay(postDelayMs, cancellationToken);
+    }
+
     /// <summary>
     /// Press and release a key using scan code mode.
     /// </summary>
@@ -97,6 +120,19 @@ public static class InputSimulator
         keybd_event(0, scanCode, KEYEVENTF_SCANCODE | KEYEVENTF_KEYDOWN, UIntPtr.Zero);
         Thread.Sleep(50);
         keybd_event(0, scanCode, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP, UIntPtr.Zero);
+    }
+
+    public static async Task PressKeyAsync(byte scanCode, CancellationToken cancellationToken = default)
+    {
+        keybd_event(0, scanCode, KEYEVENTF_SCANCODE | KEYEVENTF_KEYDOWN, UIntPtr.Zero);
+        try
+        {
+            await Task.Delay(50, cancellationToken);
+        }
+        finally
+        {
+            keybd_event(0, scanCode, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP, UIntPtr.Zero);
+        }
     }
 
     /// <summary>
@@ -123,5 +159,22 @@ public static class InputSimulator
         keybd_event(0, scanCode, KEYEVENTF_SCANCODE | KEYEVENTF_KEYDOWN, UIntPtr.Zero);
         Thread.Sleep(holdDurationMs);
         keybd_event(0, scanCode, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP, UIntPtr.Zero);
+    }
+
+    public static async Task HoldKeyAsync(
+        byte scanCode, int holdDurationMs, CancellationToken cancellationToken = default)
+    {
+        if (holdDurationMs < 0)
+            throw new ArgumentOutOfRangeException(nameof(holdDurationMs));
+
+        keybd_event(0, scanCode, KEYEVENTF_SCANCODE | KEYEVENTF_KEYDOWN, UIntPtr.Zero);
+        try
+        {
+            await Task.Delay(holdDurationMs, cancellationToken);
+        }
+        finally
+        {
+            keybd_event(0, scanCode, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP, UIntPtr.Zero);
+        }
     }
 }

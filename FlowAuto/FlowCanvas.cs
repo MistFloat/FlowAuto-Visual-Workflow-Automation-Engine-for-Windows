@@ -25,8 +25,19 @@ public class FlowCanvas : Panel
     private const int ConnectorRadius = 12;
     private const int GridSize = 20;
 
+    // Reused drawing resources avoid GDI allocation churn on canvases with many nodes.
+    private readonly Bitmap _gridTile = CreateGridTile();
+    private readonly TextureBrush _gridBrush;
+    private readonly Font _nodeNameFont = new("Segoe UI", 10, FontStyle.Bold);
+    private readonly Font _nodeTypeFont = new("Segoe UI", 8);
+    private readonly Font _parameterFont = new("Consolas", 7);
+    private readonly Font _connectorLabelFont = new("Segoe UI", 7, FontStyle.Bold);
+    private readonly Font _smallConnectorLabelFont = new("Segoe UI", 6, FontStyle.Bold);
+    private readonly Font _smallLabelFont = new("Segoe UI", 6);
+
     // Drag state
     private bool _isDragging;
+    private bool _nodesMovedDuringDrag;
     private Point _dragStart;
     private int _dragNodeIndex = -1;
 
@@ -63,8 +74,12 @@ public class FlowCanvas : Panel
 
     public FlowCanvas()
     {
+        _gridBrush = new TextureBrush(
+            _gridTile,
+            System.Drawing.Drawing2D.WrapMode.Tile);
+
         DoubleBuffered = true;
-        BackColor = Color.FromArgb(40, 40, 45);
+        BackColor = AppTheme.Canvas;
         AllowDrop = true;
         TabStop = true;
         SetStyle(ControlStyles.Selectable |
@@ -74,6 +89,33 @@ public class FlowCanvas : Panel
 
         SetupContextMenu();
         SetupScrollBars();
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _gridBrush.Dispose();
+            _gridTile.Dispose();
+            _nodeNameFont.Dispose();
+            _nodeTypeFont.Dispose();
+            _parameterFont.Dispose();
+            _connectorLabelFont.Dispose();
+            _smallConnectorLabelFont.Dispose();
+            _smallLabelFont.Dispose();
+        }
+
+        base.Dispose(disposing);
+    }
+
+    private static Bitmap CreateGridTile()
+    {
+        var tile = new Bitmap(GridSize, GridSize);
+        using var graphics = Graphics.FromImage(tile);
+        graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+        using var brush = new SolidBrush(Color.FromArgb(70, 64, 73, 92));
+        graphics.FillEllipse(brush, 0, 0, 1.5f, 1.5f);
+        return tile;
     }
 
     private void SetupScrollBars()
@@ -155,14 +197,17 @@ public class FlowCanvas : Panel
     /// </summary>
     private FlowConnection? HitTestConnection(Point pt)
     {
+        if (Connections.Count == 0) return null;
+
         using var path = new System.Drawing.Drawing2D.GraphicsPath();
         using var pen = new Pen(Color.Black, 8); // Wide hit-test area
+        var nodesById = CreateNodeLookup();
 
         foreach (var conn in Connections)
         {
-            var fromNode = Nodes.FirstOrDefault(n => n.NodeId == conn.FromId);
-            var toNode = Nodes.FirstOrDefault(n => n.NodeId == conn.ToId);
-            if (fromNode == null || toNode == null) continue;
+            if (!nodesById.TryGetValue(conn.FromId, out var fromNode) ||
+                !nodesById.TryGetValue(conn.ToId, out var toNode))
+                continue;
 
             var start = GetConnectorPoint(fromNode, conn.FromPort);
             var end = GetTargetConnectorPoint(toNode, conn.ToPort);
@@ -176,6 +221,21 @@ public class FlowCanvas : Panel
                 return conn;
         }
         return null;
+    }
+
+    /// <summary>
+    /// Builds a node-id lookup for connection rendering and hit testing.
+    /// Preserve the first node for duplicate IDs to retain the previous lookup behavior.
+    /// </summary>
+    private Dictionary<string, FlowNode> CreateNodeLookup()
+    {
+        var nodesById = new Dictionary<string, FlowNode>(Nodes.Count, StringComparer.Ordinal);
+        foreach (var node in Nodes)
+        {
+            nodesById.TryAdd(node.NodeId, node);
+        }
+
+        return nodesById;
     }
 
     // ============ Node Management ============
@@ -194,7 +254,27 @@ public class FlowCanvas : Panel
             node.CanvasY = 50;
         }
 
+        AddNodeCore(node);
+    }
+
+    /// <summary>
+    /// Adds a node that has already been positioned and creates the matching LoopEnd
+    /// marker when the node is a LoopStart. Keeping this in one path ensures toolbox
+    /// and drag-and-drop additions preserve the same loop-pair invariant.
+    /// </summary>
+    private void AddNodeCore(FlowNode node)
+    {
         Nodes.Add(node);
+
+        if (node.NodeType == NodeType.Loop)
+        {
+            var loopEnd = CreateDefaultNode(NodeType.LoopEnd);
+            loopEnd.PairedLoopStartId = node.NodeId;
+            loopEnd.CanvasX = node.CanvasX;
+            loopEnd.CanvasY = node.CanvasY + CardHeight + 120;
+            Nodes.Add(loopEnd);
+        }
+
         UpdateScrollBars();
         NodesChanged?.Invoke();
         Invalidate();
@@ -347,6 +427,58 @@ public class FlowCanvas : Panel
         Connections.Clear();
         Connections.AddRange(connections);
         ConnectionsChanged?.Invoke();
+        Invalidate();
+    }
+
+    /// <summary>
+    /// Arrange the graph into readable top-to-bottom layers. Disconnected and
+    /// cyclic nodes are retained in deterministic trailing layers.
+    /// </summary>
+    public void AutoLayout()
+    {
+        if (Nodes.Count == 0) return;
+
+        var nodeById = Nodes.ToDictionary(n => n.NodeId, StringComparer.Ordinal);
+        var incoming = Nodes.ToDictionary(n => n.NodeId, _ => 0, StringComparer.Ordinal);
+        var outgoing = Nodes.ToDictionary(n => n.NodeId, _ => new List<string>(), StringComparer.Ordinal);
+        foreach (var connection in Connections)
+        {
+            if (!nodeById.ContainsKey(connection.FromId) || !nodeById.ContainsKey(connection.ToId)) continue;
+            incoming[connection.ToId]++;
+            outgoing[connection.FromId].Add(connection.ToId);
+        }
+
+        var queue = new Queue<string>(Nodes.Where(n => incoming[n.NodeId] == 0).Select(n => n.NodeId));
+        var level = Nodes.ToDictionary(n => n.NodeId, _ => 0, StringComparer.Ordinal);
+        var visited = new HashSet<string>(StringComparer.Ordinal);
+        while (queue.Count > 0)
+        {
+            var id = queue.Dequeue();
+            if (!visited.Add(id)) continue;
+            foreach (var target in outgoing[id])
+            {
+                level[target] = Math.Max(level[target], level[id] + 1);
+                if (--incoming[target] == 0) queue.Enqueue(target);
+            }
+        }
+
+        var trailingLevel = level.Values.DefaultIfEmpty(0).Max() + 1;
+        foreach (var node in Nodes.Where(n => !visited.Contains(n.NodeId))) level[node.NodeId] = trailingLevel++;
+
+        foreach (var group in Nodes.GroupBy(n => level[n.NodeId]).OrderBy(g => g.Key))
+        {
+            var row = group.ToList();
+            for (var i = 0; i < row.Count; i++)
+            {
+                row[i].CanvasX = 60 + i * (CardWidth + 60);
+                row[i].CanvasY = 60 + group.Key * (CardHeight + 70);
+            }
+        }
+
+        _scrollX = _scrollY = 0;
+        _hScroll.Value = _vScroll.Value = 0;
+        UpdateScrollBars();
+        NodesChanged?.Invoke();
         Invalidate();
     }
 
@@ -614,8 +746,18 @@ public class FlowCanvas : Panel
         // Draw grid aligned to scroll offset
         DrawGrid(g);
 
-        // Draw connections
-        DrawConnections(g);
+        // Draw connections. Build the ID lookup once for this paint, instead of
+        // linearly searching nodes again for every connection.
+        Dictionary<string, FlowNode>? nodesById = null;
+        if (Connections.Count > 0 || _isReconnecting)
+        {
+            nodesById = CreateNodeLookup();
+        }
+
+        if (Connections.Count > 0)
+        {
+            DrawConnections(g, nodesById!);
+        }
 
         // Draw active connection line while dragging
         if (_isConnecting)
@@ -626,7 +768,7 @@ public class FlowCanvas : Panel
         // Draw reconnecting line while re-routing an existing connection
         if (_isReconnecting)
         {
-            DrawReconnectingLine(g);
+            DrawReconnectingLine(g, nodesById!);
         }
 
         // Draw nodes
@@ -644,28 +786,23 @@ public class FlowCanvas : Panel
 
     private void DrawGrid(Graphics g)
     {
-        using var pen = new Pen(Color.FromArgb(30, 60, 60, 60));
-        int startX = (_scrollX / GridSize) * GridSize;
-        int startY = (_scrollY / GridSize) * GridSize;
-        int right = _scrollX + ClientSize.Width;
-        int bottom = _scrollY + ClientSize.Height;
-
-        for (int x = startX; x <= right; x += GridSize)
-            g.DrawLine(pen, x - _scrollX, 0, x - _scrollX, ClientSize.Height);
-        for (int y = startY; y <= bottom; y += GridSize)
-            g.DrawLine(pen, 0, y - _scrollY, ClientSize.Width, y - _scrollY);
+        // A tiled brush draws the same scroll-aligned dot grid with one paint
+        // operation rather than issuing one FillEllipse call for every point.
+        _gridBrush.ResetTransform();
+        _gridBrush.TranslateTransform(-(_scrollX % GridSize), -(_scrollY % GridSize));
+        g.FillRectangle(_gridBrush, ClientRectangle);
     }
 
-    private void DrawConnections(Graphics g)
+    private void DrawConnections(Graphics g, IReadOnlyDictionary<string, FlowNode> nodesById)
     {
         using var pen = new Pen(Color.FromArgb(100, 180, 180, 180), 2);
         pen.EndCap = System.Drawing.Drawing2D.LineCap.ArrowAnchor;
 
         foreach (var conn in Connections)
         {
-            var fromNode = Nodes.FirstOrDefault(n => n.NodeId == conn.FromId);
-            var toNode = Nodes.FirstOrDefault(n => n.NodeId == conn.ToId);
-            if (fromNode == null || toNode == null) continue;
+            if (!nodesById.TryGetValue(conn.FromId, out var fromNode) ||
+                !nodesById.TryGetValue(conn.ToId, out var toNode))
+                continue;
 
             var start = GetConnectorPoint(fromNode, conn.FromPort);
             var end = GetTargetConnectorPoint(toNode, conn.ToPort);
@@ -691,13 +828,13 @@ public class FlowCanvas : Panel
         }
     }
 
-    private void DrawReconnectingLine(Graphics g)
+    private void DrawReconnectingLine(Graphics g, IReadOnlyDictionary<string, FlowNode> nodesById)
     {
         if (_reconnectConnection == null) return;
 
-        var fromNode = Nodes.FirstOrDefault(n => n.NodeId == _reconnectConnection.FromId);
-        var toNode = Nodes.FirstOrDefault(n => n.NodeId == _reconnectConnection.ToId);
-        if (fromNode == null || toNode == null) return;
+        if (!nodesById.TryGetValue(_reconnectConnection.FromId, out var fromNode) ||
+            !nodesById.TryGetValue(_reconnectConnection.ToId, out var toNode))
+            return;
 
         Point start, end;
         if (_reconnectFromInput)
@@ -775,18 +912,18 @@ public class FlowCanvas : Panel
         }
 
         // Card background
-        using var cardBrush = new SolidBrush(Color.FromArgb(52, 52, 57));
+        using var cardBrush = new SolidBrush(AppTheme.SurfaceRaised);
         g.FillRoundedRectangle(cardBrush, rect, 8);
 
         // Selection border
         if (isSelected)
         {
-            using var selPen = new Pen(Color.Red, 2);
+            using var selPen = new Pen(AppTheme.Accent, 2.5f);
             g.DrawRoundedRectangle(selPen, rect, 8);
         }
         else
         {
-            using var borderPen = new Pen(Color.FromArgb(80, 80, 85));
+            using var borderPen = new Pen(AppTheme.Border);
             g.DrawRoundedRectangle(borderPen, rect, 8);
         }
 
@@ -803,13 +940,11 @@ public class FlowCanvas : Panel
         }
 
         // Node name
-        using var nameFont = new Font("Segoe UI", 10, FontStyle.Bold);
-        using var nameBrush = new SolidBrush(Color.White);
+        using var nameBrush = new SolidBrush(AppTheme.Text);
         var nameRect = new Rectangle(rect.X + 14, rect.Y + 6, rect.Width - 30, 22);
-        g.DrawString(node.NodeName, nameFont, nameBrush, nameRect);
+        g.DrawString(node.NodeName, _nodeNameFont, nameBrush, nameRect);
 
         // Node type
-        using var typeFont = new Font("Segoe UI", 8);
         using var typeBrush = new SolidBrush(baseColor);
         var typeRect = new Rectangle(rect.X + 14, rect.Y + 28, rect.Width - 20, 16);
         var displayType = node.NodeType switch
@@ -818,14 +953,13 @@ public class FlowCanvas : Panel
             NodeType.LoopEnd => "Loop End",
             _ => node.NodeType.ToString()
         };
-        g.DrawString(displayType, typeFont, typeBrush, typeRect);
+        g.DrawString(displayType, _nodeTypeFont, typeBrush, typeRect);
 
         // Parameter summary
-        using var paramFont = new Font("Consolas", 7);
-        using var paramBrush = new SolidBrush(Color.FromArgb(180, 180, 180));
+        using var paramBrush = new SolidBrush(AppTheme.TextMuted);
         var paramRect = new Rectangle(rect.X + 14, rect.Y + 44, rect.Width - 20, 32);
         var summary = GetParameterSummary(node);
-        g.DrawString(summary, paramFont, paramBrush, paramRect);
+        g.DrawString(summary, _parameterFont, paramBrush, paramRect);
 
         // Input connector (standard nodes only; Gate and LoopStart have their own multi-input drawn below)
         if (node.NodeType != NodeType.Gate && node.NodeType != NodeType.Loop)
@@ -847,11 +981,10 @@ public class FlowCanvas : Panel
             g.FillEllipse(trueBrush, truePt.X - ConnectorRadius / 2, truePt.Y - ConnectorRadius / 2, ConnectorRadius, ConnectorRadius);
             using var connPen = new Pen(Color.FromArgb(100, 180, 180, 180));
             g.DrawEllipse(connPen, truePt.X - ConnectorRadius / 2, truePt.Y - ConnectorRadius / 2, ConnectorRadius, ConnectorRadius);
-            using var labelFont = new Font("Segoe UI", 7, FontStyle.Bold);
             using var labelBrush = new SolidBrush(Color.FromArgb(52, 168, 83));
             var trueLabel = node.NodeType == NodeType.Loop ? "Complete" :
                             node.NodeType == NodeType.Break ? "Break" : "True";
-            g.DrawString(trueLabel, labelFont, labelBrush, truePt.X - 16, truePt.Y + ConnectorRadius + 2);
+            g.DrawString(trueLabel, _connectorLabelFont, labelBrush, truePt.X - 16, truePt.Y + ConnectorRadius + 2);
 
             // False/Break connector (red)
             var falsePt = GetFalseConnector(node);
@@ -862,7 +995,7 @@ public class FlowCanvas : Panel
             using var flabelBrush = new SolidBrush(Color.FromArgb(233, 30, 99));
             var falseLabel = node.NodeType == NodeType.Loop ? "Break" :
                              node.NodeType == NodeType.Break ? "Continue" : "False";
-            g.DrawString(falseLabel, labelFont, flabelBrush, falsePt.X - 12, falsePt.Y + ConnectorRadius + 2);
+            g.DrawString(falseLabel, _connectorLabelFont, flabelBrush, falsePt.X - 12, falsePt.Y + ConnectorRadius + 2);
         }
         else if (node.NodeType == NodeType.ColorMotion)
         {
@@ -871,7 +1004,6 @@ public class FlowCanvas : Panel
             {
                 // Multi-direction output ports
                 var ports = GetDirectionPorts(node);
-                using var labelFont = new Font("Segoe UI", 6, FontStyle.Bold);
                 foreach (var (portName, portPt) in ports)
                 {
                     using var dirBrush = new SolidBrush(GetDirectionColor(portName));
@@ -879,7 +1011,7 @@ public class FlowCanvas : Panel
                     using var connPen = new Pen(Color.FromArgb(100, 180, 180, 180));
                     g.DrawEllipse(connPen, portPt.X - ConnectorRadius / 2, portPt.Y - ConnectorRadius / 2, ConnectorRadius, ConnectorRadius);
                     using var lBrush = new SolidBrush(GetDirectionColor(portName));
-                    g.DrawString(portName, labelFont, lBrush, portPt.X - 10, portPt.Y + ConnectorRadius + 2);
+                    g.DrawString(portName, _smallConnectorLabelFont, lBrush, portPt.X - 10, portPt.Y + ConnectorRadius + 2);
                 }
             }
             else
@@ -892,7 +1024,6 @@ public class FlowCanvas : Panel
         {
             // Result-based output ports
             var ports = GetResultPorts(node);
-            using var labelFont = new Font("Segoe UI", 6, FontStyle.Bold);
             var defaultColors = new[] {
                 Color.FromArgb(52, 168, 83), Color.FromArgb(233, 30, 99),
                 Color.FromArgb(66, 133, 244), Color.FromArgb(251, 188, 4),
@@ -907,7 +1038,7 @@ public class FlowCanvas : Panel
                 using var connPen = new Pen(Color.FromArgb(100, 180, 180, 180));
                 g.DrawEllipse(connPen, portPt.X - ConnectorRadius / 2, portPt.Y - ConnectorRadius / 2, ConnectorRadius, ConnectorRadius);
                 using var lBrush = new SolidBrush(col);
-                g.DrawString(portName, labelFont, lBrush, portPt.X - 10, portPt.Y + ConnectorRadius + 2);
+                g.DrawString(portName, _smallConnectorLabelFont, lBrush, portPt.X - 10, portPt.Y + ConnectorRadius + 2);
             }
         }
         else if (node.NodeType == NodeType.Gate)
@@ -918,9 +1049,8 @@ public class FlowCanvas : Panel
             g.FillEllipse(gateBrush, outputPt.X - ConnectorRadius / 2, outputPt.Y - ConnectorRadius / 2, ConnectorRadius, ConnectorRadius);
             using var connPen = new Pen(Color.FromArgb(100, 180, 180, 180));
             g.DrawEllipse(connPen, outputPt.X - ConnectorRadius / 2, outputPt.Y - ConnectorRadius / 2, ConnectorRadius, ConnectorRadius);
-            using var labelFont = new Font("Segoe UI", 7, FontStyle.Bold);
             using var labelBrush = new SolidBrush(Color.FromArgb(0, 188, 212));
-            g.DrawString("Result", labelFont, labelBrush, outputPt.X - 14, outputPt.Y + ConnectorRadius + 2);
+            g.DrawString("Result", _connectorLabelFont, labelBrush, outputPt.X - 14, outputPt.Y + ConnectorRadius + 2);
         }
         else
         {
@@ -939,16 +1069,15 @@ public class FlowCanvas : Panel
 
             using var inputBrush = new SolidBrush(Color.FromArgb(0, 188, 212));
             using var inputPen = new Pen(Color.FromArgb(100, 180, 180, 180));
-            using var inputLabelFont = new Font("Segoe UI", 6);
             using var inputLabelBrush = new SolidBrush(Color.FromArgb(150, 150, 150));
 
             g.FillEllipse(inputBrush, leftInput.X - ConnectorRadius / 2, leftInput.Y - ConnectorRadius / 2, ConnectorRadius, ConnectorRadius);
             g.DrawEllipse(inputPen, leftInput.X - ConnectorRadius / 2, leftInput.Y - ConnectorRadius / 2, ConnectorRadius, ConnectorRadius);
-            g.DrawString("0", inputLabelFont, inputLabelBrush, leftInput.X - 3, leftInput.Y - ConnectorRadius - 8);
+            g.DrawString("0", _smallLabelFont, inputLabelBrush, leftInput.X - 3, leftInput.Y - ConnectorRadius - 8);
 
             g.FillEllipse(inputBrush, rightInput.X - ConnectorRadius / 2, rightInput.Y - ConnectorRadius / 2, ConnectorRadius, ConnectorRadius);
             g.DrawEllipse(inputPen, rightInput.X - ConnectorRadius / 2, rightInput.Y - ConnectorRadius / 2, ConnectorRadius, ConnectorRadius);
-            g.DrawString("1", inputLabelFont, inputLabelBrush, rightInput.X - 3, rightInput.Y - ConnectorRadius - 8);
+            g.DrawString("1", _smallLabelFont, inputLabelBrush, rightInput.X - 3, rightInput.Y - ConnectorRadius - 8);
         }
 
         // Loop node in BreakCondition mode: white break-condition input port on LEFT side
@@ -972,9 +1101,8 @@ public class FlowCanvas : Panel
                 g.FillEllipse(whiteBrush, breakCondPt.X - ConnectorRadius / 2, breakCondPt.Y - ConnectorRadius / 2, ConnectorRadius, ConnectorRadius);
                 using var whitePen = new Pen(Color.FromArgb(180, 255, 255, 255), 2);
                 g.DrawEllipse(whitePen, breakCondPt.X - ConnectorRadius / 2, breakCondPt.Y - ConnectorRadius / 2, ConnectorRadius, ConnectorRadius);
-                using var bcFont = new Font("Segoe UI", 6, FontStyle.Bold);
                 using var bcBrush = new SolidBrush(Color.White);
-                g.DrawString("Break", bcFont, bcBrush, breakCondPt.X - ConnectorRadius - 16, breakCondPt.Y - 6);
+                g.DrawString("Break", _smallConnectorLabelFont, bcBrush, breakCondPt.X - ConnectorRadius - 16, breakCondPt.Y - 6);
             }
         }
     }
@@ -984,22 +1112,20 @@ public class FlowCanvas : Panel
     /// </summary>
     private void DrawTrueFalsePorts(Graphics g, FlowNode node)
     {
-        using var labelFont = new Font("Segoe UI", 7, FontStyle.Bold);
-
         var truePt = GetTrueConnector(node);
         using var trueBrush = new SolidBrush(Color.FromArgb(52, 168, 83));
         g.FillEllipse(trueBrush, truePt.X - ConnectorRadius / 2, truePt.Y - ConnectorRadius / 2, ConnectorRadius, ConnectorRadius);
         using var connPen = new Pen(Color.FromArgb(100, 180, 180, 180));
         g.DrawEllipse(connPen, truePt.X - ConnectorRadius / 2, truePt.Y - ConnectorRadius / 2, ConnectorRadius, ConnectorRadius);
         using var trueLB = new SolidBrush(Color.FromArgb(52, 168, 83));
-        g.DrawString("True", labelFont, trueLB, truePt.X - 12, truePt.Y + ConnectorRadius + 2);
+        g.DrawString("True", _connectorLabelFont, trueLB, truePt.X - 12, truePt.Y + ConnectorRadius + 2);
 
         var falsePt = GetFalseConnector(node);
         using var falseBrush = new SolidBrush(Color.FromArgb(233, 30, 99));
         g.FillEllipse(falseBrush, falsePt.X - ConnectorRadius / 2, falsePt.Y - ConnectorRadius / 2, ConnectorRadius, ConnectorRadius);
         g.DrawEllipse(connPen, falsePt.X - ConnectorRadius / 2, falsePt.Y - ConnectorRadius / 2, ConnectorRadius, ConnectorRadius);
         using var falseLB = new SolidBrush(Color.FromArgb(233, 30, 99));
-        g.DrawString("False", labelFont, falseLB, falsePt.X - 14, falsePt.Y + ConnectorRadius + 2);
+        g.DrawString("False", _connectorLabelFont, falseLB, falsePt.X - 14, falsePt.Y + ConnectorRadius + 2);
     }
 
     private static Color GetDirectionColor(string direction) => direction switch
@@ -1248,6 +1374,7 @@ public class FlowCanvas : Panel
                     {
                         // Keep selection, start multi-drag
                         _isDragging = true;
+                        _nodesMovedDuringDrag = false;
                         _dragStart = virtualPt;
                         _dragNodeIndex = idx;
                         _dragInitialPositions.Clear();
@@ -1260,6 +1387,7 @@ public class FlowCanvas : Panel
                     {
                         SelectSingleNode(idx);
                         _isDragging = true;
+                        _nodesMovedDuringDrag = false;
                         _dragStart = virtualPt;
                         _dragNodeIndex = idx;
                         _dragInitialPositions.Clear();
@@ -1314,21 +1442,26 @@ public class FlowCanvas : Panel
             return;
         }
 
-        // Hover detection for connections
-        var prevHover = _hoveredConnection;
-        _hoveredConnection = HitTestConnection(testPt);
-        if (_hoveredConnection != prevHover)
-        {
-            Invalidate();
-            // Change cursor to indicate interactivity
-            Cursor = _hoveredConnection != null ? Cursors.Hand : Cursors.Default;
-        }
-
         if (_isDragging && _dragNodeIndex >= 0 && _dragNodeIndex < Nodes.Count)
         {
+            // Moving a node repaints the canvas continuously. Connection hit
+            // testing is expensive and cannot affect drag behavior, so skip it.
+            bool clearedHover = _hoveredConnection != null;
+            if (clearedHover)
+            {
+                _hoveredConnection = null;
+                Cursor = Cursors.Default;
+            }
+
             var virtualPt = new Point(e.X + _scrollX, e.Y + _scrollY);
             var dx = virtualPt.X - _dragStart.X;
             var dy = virtualPt.Y - _dragStart.Y;
+
+            if (dx == 0 && dy == 0)
+            {
+                if (clearedHover) Invalidate();
+                return;
+            }
 
             if (SelectedNodeIndices.Count > 1 && SelectedNodeIndices.Contains(_dragNodeIndex))
             {
@@ -1351,8 +1484,20 @@ public class FlowCanvas : Panel
                 _dragStart = virtualPt;
             }
 
+            _nodesMovedDuringDrag = true;
             UpdateScrollBars();
             Invalidate();
+            return;
+        }
+
+        // Hover detection for connections
+        var prevHover = _hoveredConnection;
+        _hoveredConnection = HitTestConnection(testPt);
+        if (_hoveredConnection != prevHover)
+        {
+            Invalidate();
+            // Change cursor to indicate interactivity
+            Cursor = _hoveredConnection != null ? Cursors.Hand : Cursors.Default;
         }
     }
 
@@ -1458,9 +1603,16 @@ public class FlowCanvas : Panel
             return;
         }
 
+        bool nodesMoved = _isDragging && _nodesMovedDuringDrag;
         _isDragging = false;
+        _nodesMovedDuringDrag = false;
         _dragNodeIndex = -1;
         _dragInitialPositions.Clear();
+
+        if (nodesMoved)
+        {
+            NodesChanged?.Invoke();
+        }
     }
 
     public void SelectNode(int index)
@@ -1541,20 +1693,7 @@ public class FlowCanvas : Panel
                 var clientPos = PointToClient(new Point(e.X, e.Y));
                 node.CanvasX = clientPos.X + _scrollX - CardWidth / 2;
                 node.CanvasY = clientPos.Y + _scrollY - CardHeight / 2;
-                Nodes.Add(node);
-
-                // ── LoopStart: auto-create paired LoopEnd below it ──
-                if (nodeType == NodeType.Loop)
-                {
-                    var loopEnd = CreateDefaultNode(NodeType.LoopEnd);
-                    loopEnd.PairedLoopStartId = node.NodeId;
-                    loopEnd.CanvasX = node.CanvasX;
-                    loopEnd.CanvasY = node.CanvasY + CardHeight + 120;
-                    Nodes.Add(loopEnd);
-                }
-
-                NodesChanged?.Invoke();
-                Invalidate();
+                AddNodeCore(node);
             }
         }
     }

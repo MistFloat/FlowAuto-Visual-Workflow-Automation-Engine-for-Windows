@@ -12,6 +12,14 @@ namespace FlowAuto.Core;
 /// </summary>
 public static class OcrHelper
 {
+    /// <summary>
+    /// Result returned by the cancellation-aware OCR wrapper.
+    /// </summary>
+    public readonly record struct SearchResult(
+        Point? Point,
+        string? AllRecognizedText,
+        bool? DebugScreenshotQueued);
+
     private static readonly Lazy<(OcrEngine? Engine, string Language)> _engineLazy = new(() =>
     {
         // Try zh-Hans first for Chinese text recognition
@@ -34,12 +42,21 @@ public static class OcrHelper
     /// Search for text in a bitmap using Windows OCR.
     /// Returns the center point of the found text, or null.
     /// </summary>
-    /// <param name="debugSavePath">If set, saves the preprocessed image for diagnosis.</param>
+    /// <param name="debugSavePath">If set, queues the captured image when text is not found.</param>
     /// <param name="allRecognizedText">Receives all OCR-recognized text for debugging.</param>
     public static Point? FindText(Bitmap bitmap, string searchText,
         out string? allRecognizedText, string? debugSavePath = null)
     {
+        return FindTextCore(bitmap, searchText, out allRecognizedText,
+            out _, debugSavePath);
+    }
+
+    private static Point? FindTextCore(Bitmap bitmap, string searchText,
+        out string? allRecognizedText, out bool? debugScreenshotQueued,
+        string? debugSavePath = null)
+    {
         allRecognizedText = null;
+        debugScreenshotQueued = null;
 
         if (Engine == null)
             throw new InvalidOperationException(
@@ -50,7 +67,10 @@ public static class OcrHelper
 
         var softwareBitmap = ConvertToSoftwareBitmap(bitmap);
         if (softwareBitmap == null)
+        {
+            debugScreenshotQueued = QueueDebugScreenshot(bitmap, debugSavePath);
             return null;
+        }
 
         try
         {
@@ -65,19 +85,6 @@ public static class OcrHelper
             allRecognizedText = allLines.Count > 0
                 ? string.Join(" | ", allLines)
                 : "(no text recognized)";
-
-            // Save debug image if requested
-            if (debugSavePath != null)
-            {
-                try
-                {
-                    var dir = Path.GetDirectoryName(debugSavePath);
-                    if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
-                        Directory.CreateDirectory(dir);
-                    bitmap.Save(debugSavePath, ImageFormat.Png);
-                }
-                catch { /* ignore debug save errors */ }
-            }
 
             // Step 1: Word-level search (best positioning for single words)
             foreach (var line in result.Lines)
@@ -113,7 +120,40 @@ public static class OcrHelper
             softwareBitmap.Dispose();
         }
 
+        // A successful OCR match is not a failure diagnostic. Avoid doing a
+        // full PNG encode/write on every normal OCR click; retain the frame
+        // only when recognition could not find the requested text.
+        debugScreenshotQueued = QueueDebugScreenshot(bitmap, debugSavePath);
         return null;
+    }
+
+    /// <summary>
+    /// Run OCR without making a flow wait for a non-cancellable WinRT recognition
+    /// call after the user has stopped it or the node has timed out. The worker
+    /// owns a bitmap clone, so it can finish and clean up safely if the caller
+    /// stops awaiting the result.
+    /// </summary>
+    public static async Task<SearchResult> FindTextAsync(
+        Bitmap bitmap, string searchText, string? debugSavePath = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(bitmap);
+        ArgumentException.ThrowIfNullOrWhiteSpace(searchText);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var workerBitmap = (Bitmap)bitmap.Clone();
+        var recognitionTask = Task.Run(() =>
+        {
+            using (workerBitmap)
+            {
+                var point = FindTextCore(workerBitmap, searchText,
+                    out var allRecognizedText, out var debugScreenshotQueued,
+                    debugSavePath);
+                return new SearchResult(point, allRecognizedText, debugScreenshotQueued);
+            }
+        });
+
+        return await recognitionTask.WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -129,6 +169,7 @@ public static class OcrHelper
         // the only contrast signal available.
 
         // Ensure the bitmap is in a format compatible with BitmapDecoder
+        Bitmap? ownedBitmap = null;
         Bitmap safeBitmap;
         if (bitmap.PixelFormat == PixelFormat.Format24bppRgb ||
             bitmap.PixelFormat == PixelFormat.Format32bppRgb ||
@@ -139,18 +180,33 @@ public static class OcrHelper
         else
         {
             // Convert to 24bpp RGB if in an unsupported format
-            safeBitmap = new Bitmap(bitmap.Width, bitmap.Height, PixelFormat.Format24bppRgb);
+            ownedBitmap = new Bitmap(bitmap.Width, bitmap.Height, PixelFormat.Format24bppRgb);
+            safeBitmap = ownedBitmap;
             using var g = Graphics.FromImage(safeBitmap);
             g.DrawImage(bitmap, new Rectangle(0, 0, safeBitmap.Width, safeBitmap.Height));
         }
 
-        using var ms = new MemoryStream();
-        safeBitmap.Save(ms, ImageFormat.Bmp);
-        ms.Seek(0, SeekOrigin.Begin);
+        try
+        {
+            using var ms = new MemoryStream();
+            safeBitmap.Save(ms, ImageFormat.Bmp);
+            ms.Seek(0, SeekOrigin.Begin);
 
-        var randomAccessStream = ms.AsRandomAccessStream();
-        var decoder = BitmapDecoder.CreateAsync(randomAccessStream).GetAwaiter().GetResult();
+            using var randomAccessStream = ms.AsRandomAccessStream();
+            var decoder = BitmapDecoder.CreateAsync(randomAccessStream).GetAwaiter().GetResult();
 
-        return decoder.GetSoftwareBitmapAsync().GetAwaiter().GetResult();
+            return decoder.GetSoftwareBitmapAsync().GetAwaiter().GetResult();
+        }
+        finally
+        {
+            ownedBitmap?.Dispose();
+        }
+    }
+
+    private static bool? QueueDebugScreenshot(Bitmap bitmap, string? debugSavePath)
+    {
+        return debugSavePath == null
+            ? null
+            : DiagnosticArtifacts.QueuePng(bitmap, debugSavePath);
     }
 }

@@ -101,9 +101,12 @@ public static class WindowHelper
     /// </summary>
     public static (int Left, int Top, int Width, int Height) GetClientBounds(IntPtr hWnd)
     {
-        GetClientRect(hWnd, out RECT clientRect);
+        if (hWnd == IntPtr.Zero || !GetClientRect(hWnd, out RECT clientRect))
+            return (0, 0, 0, 0);
+
         var pt = new POINT { X = 0, Y = 0 };
-        ClientToScreen(hWnd, ref pt);
+        if (!ClientToScreen(hWnd, ref pt))
+            return (0, 0, 0, 0);
 
         return (pt.X, pt.Y, clientRect.Width, clientRect.Height);
     }
@@ -129,6 +132,34 @@ public static class WindowHelper
             if (hWnd != IntPtr.Zero) return hWnd;
             Thread.Sleep(checkIntervalMs);
         }
+        return IntPtr.Zero;
+    }
+
+    /// <summary>
+    /// Wait for a window without blocking a worker thread, while observing stop requests.
+    /// </summary>
+    public static async Task<IntPtr> WaitForWindowAsync(
+        string titleKeyword, int timeoutMs, int checkIntervalMs = 500,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(titleKeyword))
+            throw new ArgumentException("Window title keyword is required.", nameof(titleKeyword));
+        if (timeoutMs < 0)
+            throw new ArgumentOutOfRangeException(nameof(timeoutMs));
+        if (checkIntervalMs <= 0)
+            throw new ArgumentOutOfRangeException(nameof(checkIntervalMs));
+
+        var stopwatch = Stopwatch.StartNew();
+        while (stopwatch.ElapsedMilliseconds < timeoutMs)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var hWnd = FindWindowByTitle(titleKeyword);
+            if (hWnd != IntPtr.Zero) return hWnd;
+
+            var remaining = timeoutMs - (int)Math.Min(timeoutMs, stopwatch.ElapsedMilliseconds);
+            await Task.Delay(Math.Min(checkIntervalMs, Math.Max(1, remaining)), cancellationToken);
+        }
+
         return IntPtr.Zero;
     }
 }

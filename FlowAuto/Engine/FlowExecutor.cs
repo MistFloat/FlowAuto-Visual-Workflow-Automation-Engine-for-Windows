@@ -11,6 +11,46 @@ namespace FlowAuto.Engine;
 public class FlowExecutor
 {
     private readonly FlowContext _context;
+    private readonly Dictionary<string, HashSet<string>> _requiredGateInputs = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Per-execution indexes for connection-based flows. Keeping these local to
+    /// one execution avoids repeatedly scanning every node while traversing a
+    /// connection (especially inside a loop body), without retaining flow data
+    /// after the run finishes.
+    /// </summary>
+    private sealed class ExecutionGraphIndex
+    {
+        public Dictionary<string, FlowNode> NodesById { get; } = new(StringComparer.Ordinal);
+        public Dictionary<string, FlowNode> PairedLoopEndsByStartId { get; } = new(StringComparer.Ordinal);
+        public Dictionary<string, List<(string ToId, string FromPort, string ToPort)>> OutgoingMap { get; } = new();
+
+        public ExecutionGraphIndex(IEnumerable<FlowNode> nodes, IEnumerable<FlowConnection> connections)
+        {
+            foreach (var node in nodes)
+            {
+                // TryAdd intentionally preserves the executor's historical
+                // FirstOrDefault behavior for malformed flows with duplicate IDs.
+                if (node.NodeId is not null)
+                    NodesById.TryAdd(node.NodeId, node);
+
+                if (node.NodeType == NodeType.LoopEnd &&
+                    node.PairedLoopStartId is not null)
+                {
+                    PairedLoopEndsByStartId.TryAdd(node.PairedLoopStartId, node);
+                }
+            }
+
+            // Preserve serialized connection order: Gate input delivery and
+            // branch traversal deliberately follow that ordering.
+            foreach (var connection in connections)
+            {
+                if (!OutgoingMap.TryGetValue(connection.FromId, out var successors))
+                    OutgoingMap[connection.FromId] = successors = new();
+                successors.Add((connection.ToId, connection.FromPort, connection.ToPort));
+            }
+        }
+    }
 
     public FlowExecutor(FlowContext context)
     {
@@ -24,6 +64,7 @@ public class FlowExecutor
     {
         _context.Logger.Info("SYSTEM", $"Starting flow: {flow.FlowName}");
         _context.CurrentNodeIndex = 0;
+        InitializeGateState(flow);
 
         if (flow.Connections != null && flow.Connections.Count > 0)
         {
@@ -37,20 +78,41 @@ public class FlowExecutor
         _context.Logger.Success("SYSTEM", $"Flow completed: {flow.FlowName}");
     }
 
+    private void InitializeGateState(FlowDefinition flow)
+    {
+        _requiredGateInputs.Clear();
+        var gateIds = flow.Nodes
+            .Where(node => node.NodeType == NodeType.Gate)
+            .Select(node => node.NodeId)
+            .ToHashSet(StringComparer.Ordinal);
+
+        foreach (var gateId in gateIds)
+        {
+            _requiredGateInputs[gateId] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            _context.Set($"{gateId}_input0", false);
+            _context.Set($"{gateId}_input1", false);
+            _context.Set($"{gateId}_input0_set", false);
+            _context.Set($"{gateId}_input1_set", false);
+        }
+
+        foreach (var connection in flow.Connections ?? [])
+        {
+            if (!gateIds.Contains(connection.ToId)) continue;
+            if (connection.ToPort.Equals("Input0", StringComparison.OrdinalIgnoreCase) ||
+                connection.ToPort.Equals("Input1", StringComparison.OrdinalIgnoreCase))
+            {
+                _requiredGateInputs[connection.ToId].Add(connection.ToPort);
+            }
+        }
+    }
+
     /// <summary>
     /// Execute nodes in connection-defined order (graph traversal).
     /// Falls back to list order for any unvisited orphan nodes.
     /// </summary>
     private async Task ExecuteNodesByConnectionsAsync(List<FlowNode> nodes, List<FlowConnection> connections)
     {
-        // Build lookup: FromId -> list of (ToId, FromPort, ToPort)
-        var outgoingMap = new Dictionary<string, List<(string ToId, string FromPort, string ToPort)>>();
-        foreach (var conn in connections)
-        {
-            if (!outgoingMap.TryGetValue(conn.FromId, out var list))
-                outgoingMap[conn.FromId] = list = new();
-            list.Add((conn.ToId, conn.FromPort, conn.ToPort));
-        }
+        var graph = new ExecutionGraphIndex(nodes, connections);
 
         // Find nodes that no other node points to (root nodes)
         var targetIds = new HashSet<string>(connections.Select(c => c.ToId));
@@ -60,20 +122,23 @@ public class FlowExecutor
         // Execute roots first (may be multiple start points)
         foreach (var root in roots)
         {
-            await TraverseNodeChainAsync(root, nodes, outgoingMap, visited);
+            await TraverseNodeChainAsync(root, graph, visited);
         }
 
-        // Execute any remaining unvisited nodes in list order
+        // Every true orphan is already included in roots. Any remaining node is
+        // connected but unreachable (for example an inactive condition branch)
+        // and must not be executed as a list fallback.
         var remaining = nodes.Where(n => !visited.Contains(n.NodeId)).ToList();
         if (remaining.Count > 0)
         {
-            await ExecuteNodeListAsync(remaining);
+            _context.Logger.Info("SYSTEM",
+                $"Skipped {remaining.Count} unreachable/inactive node(s): " +
+                string.Join(", ", remaining.Select(node => node.NodeName)));
         }
     }
 
     private async Task TraverseNodeChainAsync(
-        FlowNode node, List<FlowNode> allNodes,
-        Dictionary<string, List<(string ToId, string FromPort, string ToPort)>> outgoingMap,
+        FlowNode node, ExecutionGraphIndex graph,
         HashSet<string> visited)
     {
         if (!visited.Add(node.NodeId)) return;
@@ -81,7 +146,7 @@ public class FlowExecutor
         // ── LoopStart: hand off to the two-block loop executor ──
         if (node.NodeType == NodeType.Loop)
         {
-            await ExecuteLoopStartAsync(node, allNodes, outgoingMap, visited);
+            await ExecuteLoopStartAsync(node, graph, visited);
             return; // LoopStart handles its own body + LoopEnd output
         }
 
@@ -105,8 +170,16 @@ public class FlowExecutor
         }
         _context.CurrentNodeIndex++;
 
+        // A Gate's Result port is an execution guard: a false result must not
+        // trigger downstream action nodes.
+        if (node.NodeType == NodeType.Gate && !_context.Get<bool>($"{node.NodeId}_result"))
+        {
+            _context.Logger.Info(node.NodeName, "Gate result is false; downstream path skipped");
+            return;
+        }
+
         // Follow all outgoing connections, with port filtering for branch-capable nodes
-        if (outgoingMap.TryGetValue(node.NodeId, out var successors))
+        if (graph.OutgoingMap.TryGetValue(node.NodeId, out var successors))
         {
             // Determine the active port filter
             string? activePort = null;
@@ -142,8 +215,8 @@ public class FlowExecutor
                 // If this connection targets a Loop's BreakCond port, set flag instead of traversing
                 if (toPort == "BreakCond")
                 {
-                    var targetLoop = allNodes.FirstOrDefault(n => n.NodeId == toId);
-                    if (targetLoop != null && targetLoop.NodeType == NodeType.Loop)
+                    if (graph.NodesById.TryGetValue(toId, out var targetLoop) &&
+                        targetLoop.NodeType == NodeType.Loop)
                     {
                         _context.Set($"{toId}_breakCond", true);
                         _context.Logger.Info(node.NodeName, $"Break condition signaled to Loop: {targetLoop.NodeName}");
@@ -151,13 +224,50 @@ public class FlowExecutor
                     continue;
                 }
 
-                var nextNode = allNodes.FirstOrDefault(n => n.NodeId == toId);
-                if (nextNode != null)
+                if (graph.NodesById.TryGetValue(toId, out var nextNode))
                 {
-                    await TraverseNodeChainAsync(nextNode, allNodes, outgoingMap, visited);
+                    if (!RegisterGateInput(node, nextNode, toPort))
+                        continue;
+                    await TraverseNodeChainAsync(nextNode, graph, visited);
                 }
             }
         }
+    }
+
+    private bool RegisterGateInput(FlowNode sourceNode, FlowNode targetNode, string toPort)
+    {
+        if (targetNode.NodeType != NodeType.Gate)
+            return true;
+
+        string? inputName = toPort.Equals("Input0", StringComparison.OrdinalIgnoreCase) ? "input0" :
+            toPort.Equals("Input1", StringComparison.OrdinalIgnoreCase) ? "input1" : null;
+        if (inputName == null)
+            return true;
+
+        bool value = ResolveBooleanResult(sourceNode);
+        _context.Set($"{targetNode.NodeId}_{inputName}", value);
+        _context.Set($"{targetNode.NodeId}_{inputName}_set", true);
+        _context.Logger.Info(targetNode.NodeName,
+            $"Received {toPort}={value} from {sourceNode.NodeName}");
+
+        var logicType = targetNode.GetParam<string>("GateLogicType") ?? "AND";
+        if (logicType.Equals("NOT", StringComparison.OrdinalIgnoreCase))
+            return _context.Get<bool>($"{targetNode.NodeId}_input0_set");
+
+        if (!_requiredGateInputs.TryGetValue(targetNode.NodeId, out var required) || required.Count == 0)
+            return true;
+
+        return required.All(port => _context.Get<bool>(
+            $"{targetNode.NodeId}_{port.ToLowerInvariant()}_set"));
+    }
+
+    private bool ResolveBooleanResult(FlowNode sourceNode)
+    {
+        if (sourceNode.NodeType == NodeType.Gate)
+            return _context.Get<bool>($"{sourceNode.NodeId}_result");
+
+        var result = _context.Get<string>($"{sourceNode.NodeId}_result");
+        return result == null || !result.Equals("False", StringComparison.OrdinalIgnoreCase);
     }
 
     private async Task ExecuteNodeListAsync(List<FlowNode> nodes)
@@ -187,23 +297,18 @@ public class FlowExecutor
         {
             try
             {
-                // WaitCondition handles its own timeout internally — don't double-guard
-                if (node.NodeType == NodeType.WaitCondition)
+                var flowCancellationToken = _context.FlowCancellationToken;
+                using var nodeTimeout = CancellationTokenSource.CreateLinkedTokenSource(flowCancellationToken);
+                nodeTimeout.CancelAfter(node.TimeoutMs);
+                try
                 {
-                    await ExecuteNodeByTypeAsync(node);
+                    using (_context.UseCancellationToken(nodeTimeout.Token))
+                        await ExecuteNodeByTypeAsync(node);
                 }
-                else
+                catch (OperationCanceledException) when (
+                    !flowCancellationToken.IsCancellationRequested && nodeTimeout.IsCancellationRequested)
                 {
-                    using var cts = new CancellationTokenSource(node.TimeoutMs);
-                    var task = ExecuteNodeByTypeAsync(node);
-                    var completed = await Task.WhenAny(task, Task.Delay(node.TimeoutMs, cts.Token));
-
-                    if (completed != task)
-                    {
-                        throw new TimeoutException($"Node timed out after {node.TimeoutMs}ms");
-                    }
-
-                    await task; // Propagate any exceptions
+                    throw new TimeoutException($"Node timed out after {node.TimeoutMs}ms");
                 }
                 _context.Logger.Success(node.NodeName, "Completed");
                 return;
@@ -217,7 +322,7 @@ public class FlowExecutor
             {
                 retries++;
                 _context.Logger.Retry(node.NodeName, retries, node.RetryCount, ex.Message);
-                await Task.Delay(1000);
+                await _context.DelayAsync(1000);
             }
             catch (Exception ex)
             {
@@ -305,7 +410,8 @@ public class FlowExecutor
         if (!string.IsNullOrEmpty(windowKeyword) && waitForWindowMs > 0)
         {
             _context.Logger.Info(node.NodeName, $"Waiting for window: \"{windowKeyword}\" ({waitForWindowMs}ms)");
-            var hWnd = WindowHelper.WaitForWindow(windowKeyword, waitForWindowMs);
+            var hWnd = await WindowHelper.WaitForWindowAsync(
+                windowKeyword, waitForWindowMs, cancellationToken: _context.CancellationToken);
             if (hWnd != IntPtr.Zero)
             {
                 _context.SetHwnd(hWnd);
@@ -363,7 +469,7 @@ public class FlowExecutor
 
         // Activate window
         WindowHelper.ActivateWindow(hWnd);
-        await Task.Delay(200);
+        await _context.DelayAsync(200);
 
         var (clientLeft, clientTop, clientWidth, clientHeight) = WindowHelper.GetClientBounds(hWnd);
         // Full window only applies to TemplateMatch and OCR; Coordinate always uses explicit Region
@@ -395,29 +501,26 @@ public class FlowExecutor
                     if (screenBmp == null)
                         throw new InvalidOperationException("Failed to capture screen region");
 
-                    // Load template
-                    using var templateMat = ImageRecognition.LoadTemplate(templatePath);
-
-                    // Multi-scale matching
-                    var result = ImageRecognition.FindTemplate(screenBmp, templateMat, minScale, maxScale, step, threshold);
+                    // Share the pre-scaled pyramid across repeated nodes/runs while
+                    // retaining it only for the duration of this match operation.
+                    using var preparedTemplate = ImageRecognition.AcquirePreparedTemplate(
+                        templatePath, minScale, maxScale, step, _context.CancellationToken);
+                    var result = ImageRecognition.FindTemplate(
+                        screenBmp, preparedTemplate.Template, threshold);
 
                     if (result == null)
                     {
-                        // Debug: save the captured screenshot for diagnosis
-                        var debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "debug_match");
-                        var debugFile = Path.Combine(debugDir,
-                            $"{DateTime.Now:yyyyMMdd_HHmmss_fff}_{node.NodeName}.png");
-                        try
-                        {
-                            if (!Directory.Exists(debugDir)) Directory.CreateDirectory(debugDir);
-                            screenBmp.Save(debugFile, System.Drawing.Imaging.ImageFormat.Png);
-                        }
-                        catch { /* ignore */ }
+                        var debugFile = DiagnosticArtifacts.CreatePngPath("debug_match", node.NodeName);
+                        var debugQueued = DiagnosticArtifacts.QueuePng(screenBmp, debugFile);
+                        var debugDetail = debugQueued
+                            ? $"Diagnostic screenshot queued for saving: {debugFile}"
+                            : "Diagnostic screenshot skipped because the write queue is busy.";
 
                         var msg = $"Template not matched (threshold: {threshold}). " +
-                                  $"Template: {Path.GetFileName(templatePath)} ({templateMat.Cols}×{templateMat.Rows}). " +
+                                  $"Template: {Path.GetFileName(templatePath)} " +
+                                  $"({preparedTemplate.Template.Scales[0].Cols}×{preparedTemplate.Template.Scales[0].Rows}). " +
                                   $"Captured region: ({captureX},{captureY}) {captureW}×{captureH}. " +
-                                  $"Debug screenshot saved to: {debugFile}";
+                                  debugDetail;
                         throw new InvalidOperationException(msg);
                     }
 
@@ -437,24 +540,25 @@ public class FlowExecutor
                     if (screenBmp == null)
                         throw new InvalidOperationException("Failed to capture screen region");
 
-                    // Debug: save the captured screenshot for diagnosis
-                    var debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "debug_ocr");
-                    var debugFile = Path.Combine(debugDir,
-                        $"{DateTime.Now:yyyyMMdd_HHmmss_fff}_{node.NodeName}.png");
+                    var debugFile = DiagnosticArtifacts.CreatePngPath("debug_ocr", node.NodeName);
 
-                    string? allOcrText = null;
-                    var ocrResult = await Task.Run(() =>
-                        OcrHelper.FindText(screenBmp, ocrText, out allOcrText, debugFile));
+                    var ocrSearch = await OcrHelper.FindTextAsync(
+                        screenBmp, ocrText, debugFile, _context.CancellationToken);
+                    var ocrResult = ocrSearch.Point;
+                    var allOcrText = ocrSearch.AllRecognizedText;
 
                     _context.Logger.Info(node.NodeName,
                         $"OCR lang: {OcrHelper.ActiveLanguage}, recognized text: [{allOcrText}]");
 
                     if (ocrResult == null)
                     {
+                        var debugDetail = ocrSearch.DebugScreenshotQueued == true
+                            ? $"Diagnostic screenshot queued for saving: {debugFile}. "
+                            : "Diagnostic screenshot skipped because the write queue is busy. ";
                         var msg = $"Text \"{ocrText}\" not found via OCR. " +
                                   $"Language: {OcrHelper.ActiveLanguage}. " +
                                   $"Recognized: [{allOcrText}]. " +
-                                  $"Debug screenshot saved to: {debugFile}. " +
+                                  debugDetail +
                                   $"Captured region: ({captureX},{captureY}) {captureW}×{captureH} " +
                                   $"from window client ({clientWidth}×{clientHeight}). " +
                                   $"Tip: For game UI, prefer TemplateMatch over OCR.";
@@ -480,21 +584,30 @@ public class FlowExecutor
 
                     if (center == null)
                     {
-                        var debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "debug_hsv");
-                        var ts = $"{DateTime.Now:yyyyMMdd_HHmmss_fff}_{node.NodeName}";
-                        var debugFile = Path.Combine(debugDir, $"{ts}.png");
-                        var filteredFile = Path.Combine(debugDir, $"{ts}_hsvfiltered.png");
+                        var debugFile = DiagnosticArtifacts.CreatePngPath("debug_hsv", node.NodeName);
+                        var filteredFile = Path.Combine(
+                            Path.GetDirectoryName(debugFile)!,
+                            $"{Path.GetFileNameWithoutExtension(debugFile)}_hsvfiltered.png");
+                        var debugQueued = DiagnosticArtifacts.QueuePng(screenBmp, debugFile);
+                        var filteredQueued = false;
                         try
                         {
-                            if (!Directory.Exists(debugDir)) Directory.CreateDirectory(debugDir);
-                            screenBmp.Save(debugFile, System.Drawing.Imaging.ImageFormat.Png);
                             using var filtered = ImageRecognition.ApplyHsvFilter(screenBmp, targetColor, hueTol, svTol);
-                            filtered.Save(filteredFile, System.Drawing.Imaging.ImageFormat.Png);
+                            filteredQueued = DiagnosticArtifacts.QueuePng(filtered, filteredFile);
                         }
-                        catch { /* ignore */ }
+                        catch (Exception exception)
+                        {
+                            DiagnosticArtifacts.ReportPreparationFailure(filteredFile, exception);
+                        }
+                        var queuedFiles = new List<string>(2);
+                        if (debugQueued) queuedFiles.Add(debugFile);
+                        if (filteredQueued) queuedFiles.Add(filteredFile);
+                        var debugDetail = queuedFiles.Count > 0
+                            ? $"Diagnostic files queued: {string.Join(", ", queuedFiles)}"
+                            : "Diagnostic files were skipped because the write queue is busy.";
                         throw new InvalidOperationException(
                             $"Target color not found. RGB={targetColor.R},{targetColor.G},{targetColor.B}, " +
-                            $"HueTol={hueTol}, SVTol={svTol}. Debug: {debugFile}, Filtered: {filteredFile}");
+                            $"HueTol={hueTol}, SVTol={svTol}. {debugDetail}");
                     }
 
                     absoluteX = clientLeft + captureX + center.Value.X;
@@ -513,32 +626,42 @@ public class FlowExecutor
                     if (screenBmp == null)
                         throw new InvalidOperationException("Failed to capture screen region");
 
-                    using var templateMat = ImageRecognition.LoadTemplate(refPath);
+                    using var preparedTemplate = ImageRecognition.AcquirePreparedTemplate(
+                        refPath, 0.5, 1.5, 0.05, _context.CancellationToken);
                     var targetColor = node.ResolveTargetRgb();
                     var hueTol = node.GetParam<int?>("HueTolerance") ?? 8;
                     var svTol = node.GetParam<int?>("SVTolerance") ?? 30;
                     var tplThreshold = node.GetParam<double?>("TemplateMatchThreshold") ?? 0.8;
 
                     var result = ImageRecognition.FindTemplateWithColorFilter(
-                        screenBmp, templateMat, targetColor, hueTol, svTol, tplThreshold);
+                        screenBmp, preparedTemplate.Template, targetColor, hueTol, svTol, tplThreshold);
 
                     if (result == null)
                     {
-                        var debugDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "debug_hsv_tpl");
-                        var ts = $"{DateTime.Now:yyyyMMdd_HHmmss_fff}_{node.NodeName}";
-                        var debugFile = Path.Combine(debugDir, $"{ts}.png");
-                        var filteredFile = Path.Combine(debugDir, $"{ts}_hsvfiltered.png");
+                        var debugFile = DiagnosticArtifacts.CreatePngPath("debug_hsv_tpl", node.NodeName);
+                        var filteredFile = Path.Combine(
+                            Path.GetDirectoryName(debugFile)!,
+                            $"{Path.GetFileNameWithoutExtension(debugFile)}_hsvfiltered.png");
+                        var debugQueued = DiagnosticArtifacts.QueuePng(screenBmp, debugFile);
+                        var filteredQueued = false;
                         try
                         {
-                            if (!Directory.Exists(debugDir)) Directory.CreateDirectory(debugDir);
-                            screenBmp.Save(debugFile, System.Drawing.Imaging.ImageFormat.Png);
                             using var filtered = ImageRecognition.ApplyHsvFilter(screenBmp, targetColor, hueTol, svTol);
-                            filtered.Save(filteredFile, System.Drawing.Imaging.ImageFormat.Png);
+                            filteredQueued = DiagnosticArtifacts.QueuePng(filtered, filteredFile);
                         }
-                        catch { /* ignore */ }
+                        catch (Exception exception)
+                        {
+                            DiagnosticArtifacts.ReportPreparationFailure(filteredFile, exception);
+                        }
+                        var queuedFiles = new List<string>(2);
+                        if (debugQueued) queuedFiles.Add(debugFile);
+                        if (filteredQueued) queuedFiles.Add(filteredFile);
+                        var debugDetail = queuedFiles.Count > 0
+                            ? $"Diagnostic files queued: {string.Join(", ", queuedFiles)}"
+                            : "Diagnostic files were skipped because the write queue is busy.";
                         throw new InvalidOperationException(
                             $"HSV+TemplateMatch failed. Ref: {Path.GetFileName(refPath)}. " +
-                            $"Color RGB={targetColor.R},{targetColor.G},{targetColor.B}. Debug: {debugFile}, Filtered: {filteredFile}");
+                            $"Color RGB={targetColor.R},{targetColor.G},{targetColor.B}. {debugDetail}");
                     }
 
                     absoluteX = clientLeft + captureX + result.Value.point.X;
@@ -553,7 +676,8 @@ public class FlowExecutor
         }
 
         // Perform click
-        InputSimulator.MoveAndClick(absoluteX, absoluteY, preDelayMs, postDelayMs);
+        await InputSimulator.MoveAndClickAsync(
+            absoluteX, absoluteY, preDelayMs, postDelayMs, _context.CancellationToken);
     }
 
     private async Task ExecuteWaitConditionAsync(FlowNode node)
@@ -579,7 +703,8 @@ public class FlowExecutor
         if (conditionType == "WindowExist" && !string.IsNullOrEmpty(targetWindow))
         {
             _context.Logger.Info(node.NodeName, $"Waiting for window: \"{targetWindow}\" ({timeoutMs}ms)");
-            var found = WindowHelper.WaitForWindow(targetWindow, timeoutMs, checkIntervalMs);
+            var found = await WindowHelper.WaitForWindowAsync(
+                targetWindow, timeoutMs, checkIntervalMs, _context.CancellationToken);
             if (found != IntPtr.Zero)
             {
                 _context.SetHwnd(found);
@@ -594,7 +719,7 @@ public class FlowExecutor
         {
             var waitMs = node.GetParam<int?>("WaitMs") ?? node.TimeoutMs;
             _context.Logger.Info(node.NodeName, $"Waiting {waitMs}ms...");
-            await Task.Delay(waitMs);
+            await _context.DelayAsync(waitMs);
             return;
         }
 
@@ -627,17 +752,17 @@ public class FlowExecutor
                 using var ocrBmp = ScreenCapture.CaptureWindowRegion(hWnd, ocrCapX, ocrCapY, ocrCapW, ocrCapH);
                 if (ocrBmp != null)
                 {
-                    string? waitOcrText = null;
-                    var ocrResult = await Task.Run(() =>
-                        OcrHelper.FindText(ocrBmp, ocrText, out waitOcrText, null));
-                    lastRecognized = waitOcrText;
+                    var ocrSearch = await OcrHelper.FindTextAsync(
+                        ocrBmp, ocrText, cancellationToken: _context.CancellationToken);
+                    var ocrResult = ocrSearch.Point;
+                    lastRecognized = ocrSearch.AllRecognizedText;
                     if (ocrResult != null)
                     {
                         _context.Logger.Success(node.NodeName, $"OCR found \"{ocrText}\" after {ocrSw.ElapsedMilliseconds}ms");
                         return;
                     }
                 }
-                await Task.Delay(checkIntervalMs);
+                await _context.DelayAsync(checkIntervalMs);
             }
             throw new TimeoutException(
                 $"OCR text \"{ocrText}\" not found within {timeoutMs}ms. " +
@@ -649,8 +774,6 @@ public class FlowExecutor
         if (string.IsNullOrEmpty(templatePath) || !File.Exists(templatePath))
             throw new FileNotFoundException($"Template image not found: {templatePath}");
 
-        using var templateMat = ImageRecognition.LoadTemplate(templatePath);
-
         // Read scale range for multi-scale matching (same as ClickElement)
         double minScale = 0.5, maxScale = 1.5, scaleStep = 0.1;
         var scaleRange = node.GetParam<TemplateScaleRange>("TemplateScaleRange");
@@ -660,6 +783,8 @@ public class FlowExecutor
             maxScale = scaleRange.Max;
             scaleStep = scaleRange.Step;
         }
+        using var preparedTemplate = ImageRecognition.AcquirePreparedTemplate(
+            templatePath, minScale, maxScale, scaleStep, _context.CancellationToken);
 
         var sw = Stopwatch.StartNew();
         var useFullScreen = node.GetParam<bool?>("UseFullScreen") ?? true;
@@ -682,11 +807,11 @@ public class FlowExecutor
             using var screenBmp = ScreenCapture.CaptureWindowRegion(hWnd, capX, capY, capW, capH);
             if (screenBmp == null)
             {
-                await Task.Delay(checkIntervalMs);
+                await _context.DelayAsync(checkIntervalMs);
                 continue;
             }
 
-            var result = ImageRecognition.FindTemplate(screenBmp, templateMat, minScale, maxScale, scaleStep, threshold);
+            var result = ImageRecognition.FindTemplate(screenBmp, preparedTemplate.Template, threshold);
 
             bool conditionMet = conditionType switch
             {
@@ -711,7 +836,7 @@ public class FlowExecutor
                     $"best confidence: {(result?.confidence ?? 0):F3})");
             }
 
-            await Task.Delay(checkIntervalMs);
+            await _context.DelayAsync(checkIntervalMs);
         }
 
         throw new TimeoutException($"Condition not met within {timeoutMs}ms");
@@ -764,13 +889,13 @@ public class FlowExecutor
             if (hWnd != IntPtr.Zero)
             {
                 WindowHelper.ActivateWindow(hWnd);
-                await Task.Delay(200);
+                await _context.DelayAsync(200);
             }
         }
         else if (_context.CurrentHwnd != IntPtr.Zero)
         {
             WindowHelper.ActivateWindow(_context.CurrentHwnd);
-            await Task.Delay(200);
+            await _context.DelayAsync(200);
         }
 
         _context.Logger.Info(node.NodeName, $"Key: {keyName} (scan: 0x{scanCode:X2}), Mode: {pressMode}");
@@ -778,17 +903,17 @@ public class FlowExecutor
         switch (pressMode)
         {
             case "Press":
-                InputSimulator.PressKey(scanCode);
+                await InputSimulator.PressKeyAsync(scanCode, _context.CancellationToken);
                 break;
             case "Hold":
-                InputSimulator.HoldKey(scanCode, holdDurationMs);
+                await InputSimulator.HoldKeyAsync(scanCode, holdDurationMs, _context.CancellationToken);
                 break;
             case "Release":
                 InputSimulator.KeyUp(scanCode);
                 break;
+            default:
+                throw new NotSupportedException($"Unknown press mode: {pressMode}");
         }
-
-        await Task.CompletedTask;
     }
 
     // ==================== LoopStart / LoopEnd (Two-Block Loop System) ====================
@@ -800,22 +925,19 @@ public class FlowExecutor
     /// After the loop finishes, execution continues from LoopEnd's output.
     /// </summary>
     private async Task ExecuteLoopStartAsync(
-        FlowNode loopStart, List<FlowNode> allNodes,
-        Dictionary<string, List<(string ToId, string FromPort, string ToPort)>> outgoingMap,
+        FlowNode loopStart, ExecutionGraphIndex graph,
         HashSet<string> visited)
     {
         var loopMode = loopStart.GetParam<string>("LoopMode") ?? "FixedCount";
         var loopCount = loopStart.GetParam<int?>("LoopCount") ?? 1;
 
         // Find the paired LoopEnd
-        var loopEnd = allNodes.FirstOrDefault(n =>
-            n.NodeType == NodeType.LoopEnd &&
-            n.PairedLoopStartId == loopStart.NodeId);
+        graph.PairedLoopEndsByStartId.TryGetValue(loopStart.NodeId, out var loopEnd);
 
         if (loopEnd == null)
         {
             // Fallback: try to locate LoopEnd by traversing connections from LoopStart's output
-            loopEnd = FindLoopEndByTraversal(loopStart, allNodes, outgoingMap);
+            loopEnd = FindLoopEndByTraversal(loopStart, graph);
         }
 
         if (loopEnd == null)
@@ -861,7 +983,7 @@ public class FlowExecutor
             {
                 // Execute one full pass of the loop body using connection traversal
                 var iterVisited = new HashSet<string> { loopStart.NodeId };
-                await TraverseLoopBodyAsync(loopStart, loopEnd, allNodes, outgoingMap, iterVisited);
+                await TraverseLoopBodyAsync(loopStart, loopEnd, graph, iterVisited);
             }
             catch (Exception ex)
             {
@@ -892,18 +1014,21 @@ public class FlowExecutor
         _context.Set($"{loopStart.NodeId}_breakCond", false);
 
         // ── Mark ALL body nodes visited so they are NEVER re-executed after the loop ──
-        CollectBodyNodeIds(loopStart, loopEnd, allNodes, outgoingMap, visited);
+        CollectBodyNodeIds(loopStart, loopEnd, graph.OutgoingMap, visited);
         visited.Add(loopEnd.NodeId);
 
         // After loop, follow LoopEnd's output connections
-        if (outgoingMap.TryGetValue(loopEnd.NodeId, out var endSucc))
+        if (graph.OutgoingMap.TryGetValue(loopEnd.NodeId, out var endSucc))
         {
             foreach (var (toId, _, toPort) in endSucc)
             {
                 if (toPort == "BreakCond") continue;
-                var nextNode = allNodes.FirstOrDefault(n => n.NodeId == toId);
-                if (nextNode != null)
-                    await TraverseNodeChainAsync(nextNode, allNodes, outgoingMap, visited);
+                if (graph.NodesById.TryGetValue(toId, out var nextNode))
+                {
+                    if (!RegisterGateInput(loopEnd, nextNode, toPort))
+                        continue;
+                    await TraverseNodeChainAsync(nextNode, graph, visited);
+                }
             }
         }
     }
@@ -913,7 +1038,7 @@ public class FlowExecutor
     /// and add them to the visited set so they are never executed after the loop finishes.
     /// </summary>
     private static void CollectBodyNodeIds(
-        FlowNode loopStart, FlowNode loopEnd, List<FlowNode> allNodes,
+        FlowNode loopStart, FlowNode loopEnd,
         Dictionary<string, List<(string ToId, string FromPort, string ToPort)>> outgoingMap,
         HashSet<string> visited)
     {
@@ -943,11 +1068,10 @@ public class FlowExecutor
     /// </summary>
     private async Task TraverseLoopBodyAsync(
         FlowNode loopStart, FlowNode loopEnd,
-        List<FlowNode> allNodes,
-        Dictionary<string, List<(string ToId, string FromPort, string ToPort)>> outgoingMap,
+        ExecutionGraphIndex graph,
         HashSet<string> iterVisited)
     {
-        if (!outgoingMap.TryGetValue(loopStart.NodeId, out var startSucc))
+        if (!graph.OutgoingMap.TryGetValue(loopStart.NodeId, out var startSucc))
             return;
 
         foreach (var (toId, _, toPort) in startSucc)
@@ -955,9 +1079,12 @@ public class FlowExecutor
             if (toId == loopEnd.NodeId) continue;          // Skip direct LoopStart→LoopEnd
             if (toPort == "BreakCond") continue;           // BreakCond is handled in TraverseNodeChainAsync
 
-            var nextNode = allNodes.FirstOrDefault(n => n.NodeId == toId);
-            if (nextNode != null)
-                await TraverseLoopBodyNodeAsync(loopStart, nextNode, loopEnd, allNodes, outgoingMap, iterVisited);
+            if (graph.NodesById.TryGetValue(toId, out var nextNode))
+            {
+                if (!RegisterGateInput(loopStart, nextNode, toPort))
+                    continue;
+                await TraverseLoopBodyNodeAsync(loopStart, nextNode, loopEnd, graph, iterVisited);
+            }
         }
     }
 
@@ -969,8 +1096,7 @@ public class FlowExecutor
     /// </summary>
     private async Task TraverseLoopBodyNodeAsync(
         FlowNode loopStart, FlowNode node, FlowNode loopEnd,
-        List<FlowNode> allNodes,
-        Dictionary<string, List<(string ToId, string FromPort, string ToPort)>> outgoingMap,
+        ExecutionGraphIndex graph,
         HashSet<string> iterVisited)
     {
         if (node.NodeId == loopEnd.NodeId) return;
@@ -981,7 +1107,7 @@ public class FlowExecutor
         {
             // Use a temporary outer visited-like set so the nested loop can track its own state
             var nestedVisited = new HashSet<string>();
-            await ExecuteLoopStartAsync(node, allNodes, outgoingMap, nestedVisited);
+            await ExecuteLoopStartAsync(node, graph, nestedVisited);
             return;
         }
 
@@ -992,6 +1118,12 @@ public class FlowExecutor
             await ExecuteNodeAsync(node);
         else
             _context.Logger.Info(node.NodeName, "Skipped (disabled)");
+
+        if (node.NodeType == NodeType.Gate && !_context.Get<bool>($"{node.NodeId}_result"))
+        {
+            _context.Logger.Info(node.NodeName, "Gate result is false; downstream path skipped");
+            return;
+        }
 
         // ── Port filtering for branch-capable nodes inside loop body ──
         // ColorCal / Condition / ColorMotion route to specific output ports based on result;
@@ -1015,7 +1147,7 @@ public class FlowExecutor
                 bodyActivePort = _context.Get<string>($"{node.NodeId}_result") ?? "True";
         }
 
-        if (!outgoingMap.TryGetValue(node.NodeId, out var succs)) return;
+        if (!graph.OutgoingMap.TryGetValue(node.NodeId, out var succs)) return;
 
         foreach (var (toId, fromPort, toPort) in succs)
         {
@@ -1032,9 +1164,12 @@ public class FlowExecutor
                 continue;
             }
 
-            var nextNode = allNodes.FirstOrDefault(n => n.NodeId == toId);
-            if (nextNode != null)
-                await TraverseLoopBodyNodeAsync(loopStart, nextNode, loopEnd, allNodes, outgoingMap, iterVisited);
+            if (graph.NodesById.TryGetValue(toId, out var nextNode))
+            {
+                if (!RegisterGateInput(node, nextNode, toPort))
+                    continue;
+                await TraverseLoopBodyNodeAsync(loopStart, nextNode, loopEnd, graph, iterVisited);
+            }
         }
     }
 
@@ -1043,10 +1178,9 @@ public class FlowExecutor
     /// The first LoopEnd encountered in the output chain is the paired one.
     /// </summary>
     private FlowNode? FindLoopEndByTraversal(
-        FlowNode loopStart, List<FlowNode> allNodes,
-        Dictionary<string, List<(string ToId, string FromPort, string ToPort)>> outgoingMap)
+        FlowNode loopStart, ExecutionGraphIndex graph)
     {
-        if (!outgoingMap.TryGetValue(loopStart.NodeId, out var startSucc))
+        if (!graph.OutgoingMap.TryGetValue(loopStart.NodeId, out var startSucc))
             return null;
 
         var searchVisited = new HashSet<string> { loopStart.NodeId };
@@ -1060,13 +1194,12 @@ public class FlowExecutor
             var nodeId = queue.Dequeue();
             if (!searchVisited.Add(nodeId)) continue;
 
-            var node = allNodes.FirstOrDefault(n => n.NodeId == nodeId);
-            if (node == null) continue;
+            if (!graph.NodesById.TryGetValue(nodeId, out var node)) continue;
 
             if (node.NodeType == NodeType.LoopEnd)
                 return node;
 
-            if (outgoingMap.TryGetValue(nodeId, out var succs))
+            if (graph.OutgoingMap.TryGetValue(nodeId, out var succs))
                 foreach (var (nextId, _, _) in succs)
                     queue.Enqueue(nextId);
         }
@@ -1162,7 +1295,6 @@ public class FlowExecutor
 
             _context.Logger.Info(node.NodeName, $"Checking ImageAppear: {Path.GetFileName(templatePath)}");
 
-            using var templateMat = ImageRecognition.LoadTemplate(templatePath);
             using var screenBmp = ScreenCapture.CaptureWindowRegion(hWnd, condX, condY, condW, condH);
             if (screenBmp != null)
             {
@@ -1176,7 +1308,9 @@ public class FlowExecutor
                     scaleStep = scaleRange.Step;
                 }
 
-                var result = ImageRecognition.FindTemplate(screenBmp, templateMat, minScale, maxScale, scaleStep, threshold);
+                using var preparedTemplate = ImageRecognition.AcquirePreparedTemplate(
+                    templatePath, minScale, maxScale, scaleStep, _context.CancellationToken);
+                var result = ImageRecognition.FindTemplate(screenBmp, preparedTemplate.Template, threshold);
                 conditionResult = result != null;
 
                 if (result != null)
@@ -1195,11 +1329,11 @@ public class FlowExecutor
             using var ocrBmp = ScreenCapture.CaptureWindowRegion(hWnd, condX, condY, condW, condH);
             if (ocrBmp != null)
             {
-                string? allText = null;
-                var ocrResult = await Task.Run(() =>
-                    OcrHelper.FindText(ocrBmp, ocrText, out allText, null));
-                conditionResult = ocrResult != null;
-                _context.Logger.Info(node.NodeName, $"OCR result: found={conditionResult}, text=[{allText}]");
+                var ocrSearch = await OcrHelper.FindTextAsync(
+                    ocrBmp, ocrText, cancellationToken: _context.CancellationToken);
+                conditionResult = ocrSearch.Point != null;
+                _context.Logger.Info(node.NodeName,
+                    $"OCR result: found={conditionResult}, text=[{ocrSearch.AllRecognizedText}]");
             }
         }
 
@@ -1279,13 +1413,16 @@ public class FlowExecutor
             var stopAt = DateTime.UtcNow.AddMilliseconds(durationMs);
             Point? lastCenter = null;
             bool motionDetected = false;
+            using var capture = new WindowRegionCaptureSession(hWnd, capX, capY, capW, capH);
 
             while (DateTime.UtcNow < stopAt && !motionDetected)
             {
                 _context.CheckCancellation();
                 await _context.WaitIfPausedAsync();
 
-                using var frame = ScreenCapture.CaptureWindowRegion(hWnd, capX, capY, capW, capH);
+                // The session owns this borrowed frame. It is reused after this
+                // iteration, so do not dispose it here or retain it asynchronously.
+                var frame = capture.Capture();
                 if (frame == null) break;
 
                 var currentCenter = ImageRecognition.DetectColorCenter(frame, targetRgb, hueTol, svTol);
@@ -1302,7 +1439,7 @@ public class FlowExecutor
                 }
 
                 if (currentCenter != null) lastCenter = currentCenter;
-                await Task.Delay(checkInterval);
+                await _context.DelayAsync(checkInterval);
             }
 
             _context.Set($"{node.NodeId}_result", motionDetected);
@@ -1324,13 +1461,14 @@ public class FlowExecutor
             var stopAt = DateTime.UtcNow.AddMilliseconds(durationMs);
             bool stateChanged = false;
             double? baselineRatio = null;
+            using var capture = new WindowRegionCaptureSession(hWnd, capX, capY, capW, capH);
 
             while (DateTime.UtcNow < stopAt && !stateChanged)
             {
                 _context.CheckCancellation();
                 await _context.WaitIfPausedAsync();
 
-                using var frame = ScreenCapture.CaptureWindowRegion(hWnd, capX, capY, capW, capH);
+                var frame = capture.Capture();
                 if (frame == null) break;
 
                 double currentRatio = ImageRecognition.CalculateColorFillRatio(frame, targetRgb, hueTol, svTol);
@@ -1346,7 +1484,7 @@ public class FlowExecutor
                     _context.Logger.Success(node.NodeName, $"State changed: {baselineRatio:F4} → {currentRatio:F4}");
                 }
 
-                await Task.Delay(checkInterval);
+                await _context.DelayAsync(checkInterval);
             }
 
             _context.Set($"{node.NodeId}_result", stateChanged);
@@ -1369,26 +1507,30 @@ public class FlowExecutor
             _context.Logger.Info(node.NodeName,
                 $"ColorMotion DirectionDetect ({trackMode}): {durationMs}ms");
 
-            Mat? refTemplateMat = null;
+            var refImagePath = node.GetParam<string>("ReferenceImagePath") ?? "";
             if (trackMode == "TemplateMatch")
             {
-                var refImagePath = node.GetParam<string>("ReferenceImagePath") ?? "";
                 if (string.IsNullOrEmpty(refImagePath) || !File.Exists(refImagePath))
                     throw new FileNotFoundException($"Reference image not found: {refImagePath}");
-                refTemplateMat = ImageRecognition.LoadTemplate(refImagePath);
             }
+
+            using var preparedTemplate = trackMode == "TemplateMatch"
+                ? ImageRecognition.AcquirePreparedTemplate(
+                    refImagePath, 0.5, 1.5, 0.05, _context.CancellationToken)
+                : null;
 
             var stopAt = DateTime.UtcNow.AddMilliseconds(durationMs);
             Point? lastCenter = null;
             string detectedDirection = "Stationary";
             bool found = false;
+            using var capture = new WindowRegionCaptureSession(hWnd, capX, capY, capW, capH);
 
             while (DateTime.UtcNow < stopAt && !found)
             {
                 _context.CheckCancellation();
                 await _context.WaitIfPausedAsync();
 
-                using var frame = ScreenCapture.CaptureWindowRegion(hWnd, capX, capY, capW, capH);
+                var frame = capture.Capture();
                 if (frame == null) break;
 
                 Point? currentCenter;
@@ -1402,7 +1544,7 @@ public class FlowExecutor
                 {
                     // Template matching within HSV-filtered regions
                     var result = ImageRecognition.FindTemplateWithColorFilter(
-                        frame, refTemplateMat!, targetRgb, hueTol, svTol, threshold);
+                        frame, preparedTemplate!.Template, targetRgb, hueTol, svTol, threshold);
                     currentCenter = result?.point;
                 }
 
@@ -1423,10 +1565,8 @@ public class FlowExecutor
                     lastCenter = currentCenter;
                 }
 
-                await Task.Delay(checkInterval);
+                await _context.DelayAsync(checkInterval);
             }
-
-            refTemplateMat?.Dispose();
 
             _context.Set($"{node.NodeId}_result", detectedDirection);
             _context.Set($"{node.NodeId}_direction", detectedDirection);
@@ -1445,13 +1585,14 @@ public class FlowExecutor
 
             var stopAt = DateTime.UtcNow.AddMilliseconds(durationMs);
             bool colorFound = false;
+            using var capture = new WindowRegionCaptureSession(hWnd, capX, capY, capW, capH);
 
             while (DateTime.UtcNow < stopAt && !colorFound)
             {
                 _context.CheckCancellation();
                 await _context.WaitIfPausedAsync();
 
-                using var frame = ScreenCapture.CaptureWindowRegion(hWnd, capX, capY, capW, capH);
+                var frame = capture.Capture();
                 if (frame == null) break;
 
                 var center = ImageRecognition.DetectColorCenter(frame, targetRgb, hueTol, svTol);
@@ -1461,7 +1602,7 @@ public class FlowExecutor
                     _context.Logger.Success(node.NodeName, $"Color detected at ({center.Value.X}, {center.Value.Y})");
                 }
 
-                await Task.Delay(checkInterval);
+                await _context.DelayAsync(checkInterval);
             }
 
             _context.Set($"{node.NodeId}_result", colorFound);
@@ -1502,7 +1643,7 @@ public class FlowExecutor
 
     // ============ ColorCal (v2.2) ============
 
-    private async Task ExecuteColorCalAsync(FlowNode node)
+    private Task ExecuteColorCalAsync(FlowNode node)
     {
         // 1. Load detection targets
         var targetsConfig = node.GetParam<List<ColorCalTarget>>("DetectionTargets") ?? new List<ColorCalTarget>();
@@ -1510,15 +1651,106 @@ public class FlowExecutor
         {
             _context.Logger.Warning(node.NodeName, "No detection targets configured");
             _context.Set($"{node.NodeId}_result", 0);
-            return;
+            return Task.CompletedTask;
         }
 
-        // 2. Detect all targets
-        var detectionResults = new List<ColorCalTargetResult>();
+        // 2. Resolve capture requests before detecting. Targets that point to the
+        // same client-area rectangle share one bitmap, so their measurements are
+        // based on the same screen frame instead of sequential screenshots.
+        var capturePlans = new List<ColorCalTargetCapturePlan>(targetsConfig.Count);
         foreach (var target in targetsConfig)
         {
-            var result = await DetectSingleTargetAsync(node, target);
-            detectionResults.Add(result);
+            var hWnd = _context.CurrentHwnd;
+            if (hWnd == IntPtr.Zero && !string.IsNullOrEmpty(target.TargetWindow))
+                hWnd = WindowHelper.FindWindowByTitle(target.TargetWindow);
+
+            if (hWnd == IntPtr.Zero)
+            {
+                capturePlans.Add(new ColorCalTargetCapturePlan(target, null));
+                continue;
+            }
+
+            var bounds = WindowHelper.GetClientBounds(hWnd);
+            int capX = target.Region.X, capY = target.Region.Y;
+            int capW = target.Region.Width, capH = target.Region.Height;
+            if (target.UseFullScreen)
+            {
+                capX = 0;
+                capY = 0;
+                capW = bounds.Width;
+                capH = bounds.Height;
+            }
+
+            capturePlans.Add(new ColorCalTargetCapturePlan(
+                target, new ColorCalCaptureRequest(hWnd, capX, capY, capW, capH)));
+        }
+
+        var remainingCaptureUses = CountColorCalCaptureUses(
+            capturePlans
+                .Where(plan => plan.CaptureRequest.HasValue)
+                .Select(plan => plan.CaptureRequest!.Value));
+        var capturedFrames = new Dictionary<ColorCalCaptureRequest, Bitmap?>();
+        var detectionResults = new List<ColorCalTargetResult>(targetsConfig.Count);
+
+        try
+        {
+            // Preserve target/result ordering even when capture requests are shared.
+            foreach (var plan in capturePlans)
+            {
+                var target = plan.Target;
+                var result = new ColorCalTargetResult { Name = target.Name };
+
+                if (plan.CaptureRequest is not { } captureRequest)
+                {
+                    // Keep the existing per-target diagnostic when no window resolves.
+                    _context.Logger.Warning(node.NodeName, $"Target '{target.Name}': No target window found");
+                    detectionResults.Add(result);
+                    continue;
+                }
+
+                if (!capturedFrames.TryGetValue(captureRequest, out var frame))
+                {
+                    frame = ScreenCapture.CaptureWindowRegion(
+                        captureRequest.WindowHandle,
+                        captureRequest.X,
+                        captureRequest.Y,
+                        captureRequest.Width,
+                        captureRequest.Height);
+                    capturedFrames.Add(captureRequest, frame);
+                }
+
+                try
+                {
+                    if (frame == null)
+                    {
+                        // A shared capture failure still reports once for each target,
+                        // matching the previous diagnostic behavior.
+                        _context.Logger.Warning(node.NodeName, $"Target '{target.Name}': Failed to capture screen");
+                    }
+                    else
+                    {
+                        result = DetectSingleTargetInFrame(node, target, frame);
+                    }
+                }
+                finally
+                {
+                    // Drop a shared frame immediately after its last consumer. The
+                    // outer finally covers exceptional exits before that point.
+                    remainingCaptureUses[captureRequest]--;
+                    if (remainingCaptureUses[captureRequest] == 0)
+                    {
+                        capturedFrames.Remove(captureRequest);
+                        frame?.Dispose();
+                    }
+                }
+
+                detectionResults.Add(result);
+            }
+        }
+        finally
+        {
+            foreach (var frame in capturedFrames.Values)
+                frame?.Dispose();
         }
 
         // 3. Store results in context for expression evaluation
@@ -1545,35 +1777,32 @@ public class FlowExecutor
 
         _context.Set($"{node.NodeId}_result", resultIndex);
         _context.Logger.Info(node.NodeName, $"ColorCal expression result: {resultIndex}");
+        return Task.CompletedTask;
     }
 
-    private async Task<ColorCalTargetResult> DetectSingleTargetAsync(FlowNode node, ColorCalTarget target)
+    private readonly record struct ColorCalCaptureRequest(
+        IntPtr WindowHandle, int X, int Y, int Width, int Height);
+
+    private readonly record struct ColorCalTargetCapturePlan(
+        ColorCalTarget Target, ColorCalCaptureRequest? CaptureRequest);
+
+    private static Dictionary<ColorCalCaptureRequest, int> CountColorCalCaptureUses(
+        IEnumerable<ColorCalCaptureRequest> captureRequests)
+    {
+        var uses = new Dictionary<ColorCalCaptureRequest, int>();
+        foreach (var captureRequest in captureRequests)
+        {
+            uses.TryGetValue(captureRequest, out var count);
+            uses[captureRequest] = count + 1;
+        }
+
+        return uses;
+    }
+
+    private ColorCalTargetResult DetectSingleTargetInFrame(
+        FlowNode node, ColorCalTarget target, Bitmap frame)
     {
         var result = new ColorCalTargetResult { Name = target.Name };
-
-        var hWnd = _context.CurrentHwnd;
-        if (hWnd == IntPtr.Zero && !string.IsNullOrEmpty(target.TargetWindow))
-            hWnd = WindowHelper.FindWindowByTitle(target.TargetWindow);
-        if (hWnd == IntPtr.Zero)
-        {
-            _context.Logger.Warning(node.NodeName, $"Target '{target.Name}': No target window found");
-            return result;
-        }
-
-        var bounds = WindowHelper.GetClientBounds(hWnd);
-        int capX = target.Region.X, capY = target.Region.Y;
-        int capW = target.Region.Width, capH = target.Region.Height;
-        if (target.UseFullScreen)
-        {
-            capX = 0; capY = 0; capW = bounds.Width; capH = bounds.Height;
-        }
-
-        using var frame = ScreenCapture.CaptureWindowRegion(hWnd, capX, capY, capW, capH);
-        if (frame == null)
-        {
-            _context.Logger.Warning(node.NodeName, $"Target '{target.Name}': Failed to capture screen");
-            return result;
-        }
 
         var targetRgb = target.GetRgbColor();
 
@@ -1584,8 +1813,11 @@ public class FlowExecutor
             {
                 try
                 {
-                    using var templateMat = ImageRecognition.LoadTemplate(target.TemplateImagePath);
-                    var matches = ImageRecognition.DetectMultipleTargets(frame, templateMat, targetRgb, target.HueTolerance, target.SVTolerance, target.TemplateMatchThreshold, 1);
+                    using var preparedTemplate = ImageRecognition.AcquirePreparedTemplate(
+                        target.TemplateImagePath, 0.5, 1.5, 0.05, _context.CancellationToken);
+                    var matches = ImageRecognition.DetectMultipleTargets(
+                        frame, preparedTemplate.Template, targetRgb, target.HueTolerance,
+                        target.SVTolerance, target.TemplateMatchThreshold, 1);
                     if (matches.Count > 0)
                     {
                         result.Found = true;
@@ -1657,7 +1889,7 @@ public class FlowExecutor
             processedExpr = processedExpr.Replace($"{alias}.Found", r.Found ? "1" : "0");
         }
 
-        // Handle nested ternary: recursively parse root-level ? :
+        // Handle nested ternary: recursively parse the outermost ? : pair.
         var rootTernary = ParseRootTernary(processedExpr);
         if (rootTernary.HasValue)
         {
@@ -1666,16 +1898,10 @@ public class FlowExecutor
             return EvaluateColorCalExpressionV2(branchToEval, results, targets, context, nodeId);
         }
 
-        // Try simple arithmetic evaluation using DataTable.Compute
-        try
-        {
-            var value = EvaluateSimpleExpression(processedExpr);
-            return (int)value;
-        }
-        catch
-        {
-            return 0;
-        }
+        var value = EvaluateSimpleExpression(processedExpr);
+        if (!double.IsFinite(value))
+            throw new InvalidOperationException("ColorCal expression produced a non-finite result.");
+        return checked((int)value);
     }
 
     /// <summary>
@@ -1684,91 +1910,91 @@ public class FlowExecutor
     /// </summary>
     private static (string Condition, string TrueExpr, string FalseExpr)? ParseRootTernary(string expr)
     {
-        expr = expr.Trim();
+        expr = StripOuterParentheses(expr);
 
-        // Strip outer parentheses if they wrap the entire expression
-        while (expr.Length > 2 && expr[0] == '(' && expr[expr.Length - 1] == ')')
-        {
-            int parenDepth = 1;
-            bool balanced = true;
-            for (int i = 1; i < expr.Length - 1; i++)
-            {
-                if (expr[i] == '(') parenDepth++;
-                else if (expr[i] == ')') parenDepth--;
-                if (parenDepth == 0) { balanced = false; break; }
-            }
-            if (balanced && parenDepth == 1)
-                expr = expr.Substring(1, expr.Length - 2).Trim();
-            else
-                break;
-        }
-
-        // Find the root-level ':' — the last ':' at the minimal parenthesis depth
-        int minDepth = int.MaxValue;
-        int colonIndex = -1;
+        // Find the first outermost question mark, then its matching colon. A
+        // nested ternary in either branch consumes one colon of its own; using
+        // the last colon (the old approach) incorrectly parsed false branches.
+        int questionIndex = -1;
         int depth = 0;
-
         for (int i = 0; i < expr.Length; i++)
         {
             char c = expr[i];
             if (c == '(') depth++;
-            else if (c == ')') depth--;
-            else if (c == ':' && depth <= minDepth)
+            else if (c == ')')
             {
-                minDepth = depth;
-                colonIndex = i;
+                if (--depth < 0)
+                    throw new FormatException("ColorCal expression has an unmatched closing parenthesis.");
+            }
+            else if (c == '?' && depth == 0)
+            {
+                questionIndex = i;
+                break;
             }
         }
 
-        if (colonIndex == -1) return null;
-
-        // Compute the depth at the colon position
-        depth = 0;
-        for (int i = 0; i < colonIndex; i++)
-        {
-            char c = expr[i];
-            if (c == '(') depth++;
-            else if (c == ')') depth--;
-        }
-        int targetDepth = depth;
-
-        // Find the matching '?' before the colon at the same depth
-        depth = 0;
-        int questionIndex = -1;
-        for (int i = 0; i < colonIndex; i++)
-        {
-            char c = expr[i];
-            if (c == '(') depth++;
-            else if (c == ')') depth--;
-            else if (c == '?' && depth == targetDepth)
-                questionIndex = i;
-        }
-
+        if (depth != 0 && questionIndex == -1)
+            throw new FormatException("ColorCal expression has an unmatched opening parenthesis.");
         if (questionIndex == -1) return null;
+
+        int colonIndex = -1;
+        depth = 0;
+        int nestedTernaries = 0;
+        for (int i = questionIndex + 1; i < expr.Length; i++)
+        {
+            char c = expr[i];
+            if (c == '(') depth++;
+            else if (c == ')')
+            {
+                if (--depth < 0)
+                    throw new FormatException("ColorCal expression has an unmatched closing parenthesis.");
+            }
+            else if (depth == 0 && c == '?')
+            {
+                nestedTernaries++;
+            }
+            else if (depth == 0 && c == ':')
+            {
+                if (nestedTernaries == 0)
+                {
+                    colonIndex = i;
+                    break;
+                }
+                nestedTernaries--;
+            }
+        }
+
+        if (colonIndex == -1)
+            throw new FormatException("ColorCal ternary expression is missing a matching ':'.");
 
         string condition = expr.Substring(0, questionIndex).Trim();
         string trueExpr = expr.Substring(questionIndex + 1, colonIndex - questionIndex - 1).Trim();
         string falseExpr = expr.Substring(colonIndex + 1).Trim();
+
+        if (condition.Length == 0 || trueExpr.Length == 0 || falseExpr.Length == 0)
+            throw new FormatException("ColorCal ternary expression has an empty branch.");
 
         return (condition, trueExpr, falseExpr);
     }
 
     private static bool EvaluateColorCalCondition(string condition)
     {
-        condition = condition.Trim();
+        condition = StripOuterParentheses(condition);
+        if (condition.Length == 0)
+            throw new FormatException("ColorCal condition is empty.");
 
-        // Support direct numeric truthiness: non-zero = true, 0 = false
-        if (double.TryParse(condition, out var directValue))
-            return Math.Abs(directValue) > 0.001;
+        if (TrySplitTopLevel(condition, "||", out var leftOr, out var rightOr))
+            return EvaluateColorCalCondition(leftOr) || EvaluateColorCalCondition(rightOr);
+        if (TrySplitTopLevel(condition, "&&", out var leftAnd, out var rightAnd))
+            return EvaluateColorCalCondition(leftAnd) && EvaluateColorCalCondition(rightAnd);
+        if (condition[0] == '!' && !condition.StartsWith("!=", StringComparison.Ordinal))
+            return !EvaluateColorCalCondition(condition[1..]);
 
-        // Support: a > b, a >= b, a < b, a <= b, a == b, a != b
-        var match = System.Text.RegularExpressions.Regex.Match(condition,
-            @"^([+-]?\d+(?:\.\d+)?)\s*(>=|<=|>|<|==|!=)\s*([+-]?\d+(?:\.\d+)?)$");
-        if (!match.Success) return false;
+        if (!TryFindTopLevelComparison(condition, out var comparisonIndex, out var op))
+            return Math.Abs(EvaluateSimpleExpression(condition)) > 0.001;
 
-        double left = double.Parse(match.Groups[1].Value);
-        string op = match.Groups[2].Value;
-        double right = double.Parse(match.Groups[3].Value);
+        double left = EvaluateSimpleExpression(condition[..comparisonIndex]);
+        double right = EvaluateSimpleExpression(condition[(comparisonIndex + op.Length)..]);
 
         return op switch
         {
@@ -1784,10 +2010,323 @@ public class FlowExecutor
 
     private static double EvaluateSimpleExpression(string expression)
     {
-        // Use DataTable.Compute for simple arithmetic
-        using var dt = new System.Data.DataTable();
-        var result = dt.Compute(expression, "");
-        return Convert.ToDouble(result);
+        return new NumericExpressionParser(expression).Parse();
+    }
+
+    private static string StripOuterParentheses(string expression)
+    {
+        var result = expression.Trim();
+        while (result.Length >= 2 && result[0] == '(' && result[^1] == ')')
+        {
+            int depth = 0;
+            bool wrapsWholeExpression = true;
+            for (int i = 0; i < result.Length; i++)
+            {
+                if (result[i] == '(') depth++;
+                else if (result[i] == ')')
+                {
+                    if (--depth < 0)
+                        throw new FormatException("ColorCal expression has an unmatched closing parenthesis.");
+                }
+
+                if (depth == 0 && i < result.Length - 1)
+                {
+                    wrapsWholeExpression = false;
+                    break;
+                }
+            }
+
+            if (depth != 0)
+                throw new FormatException("ColorCal expression has an unmatched opening parenthesis.");
+            if (!wrapsWholeExpression) break;
+            result = result[1..^1].Trim();
+        }
+
+        return result;
+    }
+
+    private static bool TrySplitTopLevel(
+        string expression, string separator, out string left, out string right)
+    {
+        int depth = 0;
+        for (int i = 0; i <= expression.Length - separator.Length; i++)
+        {
+            char c = expression[i];
+            if (c == '(')
+            {
+                depth++;
+                continue;
+            }
+            if (c == ')')
+            {
+                if (--depth < 0)
+                    throw new FormatException("ColorCal expression has an unmatched closing parenthesis.");
+                continue;
+            }
+
+            if (depth == 0 && string.CompareOrdinal(expression, i, separator, 0, separator.Length) == 0)
+            {
+                left = expression[..i].Trim();
+                right = expression[(i + separator.Length)..].Trim();
+                if (left.Length == 0 || right.Length == 0)
+                    throw new FormatException("ColorCal logical expression has an empty operand.");
+                return true;
+            }
+        }
+
+        if (depth != 0)
+            throw new FormatException("ColorCal expression has an unmatched opening parenthesis.");
+        left = right = string.Empty;
+        return false;
+    }
+
+    private static bool TryFindTopLevelComparison(
+        string expression, out int index, out string op)
+    {
+        int depth = 0;
+        for (int i = 0; i < expression.Length; i++)
+        {
+            char c = expression[i];
+            if (c == '(')
+            {
+                depth++;
+                continue;
+            }
+            if (c == ')')
+            {
+                if (--depth < 0)
+                    throw new FormatException("ColorCal expression has an unmatched closing parenthesis.");
+                continue;
+            }
+            if (depth != 0) continue;
+
+            if (c is '>' or '<' or '=' or '!')
+            {
+                string candidate = i + 1 < expression.Length && expression[i + 1] == '='
+                    ? expression.Substring(i, 2)
+                    : expression.Substring(i, 1);
+                if (candidate is ">" or ">=" or "<" or "<=" or "==" or "!=")
+                {
+                    index = i;
+                    op = candidate;
+                    return true;
+                }
+            }
+        }
+
+        if (depth != 0)
+            throw new FormatException("ColorCal expression has an unmatched opening parenthesis.");
+        index = -1;
+        op = string.Empty;
+        return false;
+    }
+
+    /// <summary>
+    /// Small, closed arithmetic parser for ColorCal expressions after target
+    /// aliases have been replaced with numbers. This avoids executing arbitrary
+    /// DataTable expressions while supporting the documented arithmetic and
+    /// common Math helpers.
+    /// </summary>
+    private sealed class NumericExpressionParser(string expression)
+    {
+        private readonly string _expression = expression ?? throw new ArgumentNullException(nameof(expression));
+        private int _position;
+
+        public double Parse()
+        {
+            var result = ParseAdditive();
+            SkipWhitespace();
+            if (_position != _expression.Length)
+                throw Error($"Unexpected token '{_expression[_position]}'.");
+            return EnsureFinite(result);
+        }
+
+        private double ParseAdditive()
+        {
+            var value = ParseMultiplicative();
+            while (true)
+            {
+                if (TryConsume('+')) value = EnsureFinite(value + ParseMultiplicative());
+                else if (TryConsume('-')) value = EnsureFinite(value - ParseMultiplicative());
+                else return value;
+            }
+        }
+
+        private double ParseMultiplicative()
+        {
+            var value = ParsePower();
+            while (true)
+            {
+                if (TryConsume('*')) value = EnsureFinite(value * ParsePower());
+                else if (TryConsume('/'))
+                {
+                    var divisor = ParsePower();
+                    if (Math.Abs(divisor) < double.Epsilon)
+                        throw new DivideByZeroException("ColorCal expression divides by zero.");
+                    value = EnsureFinite(value / divisor);
+                }
+                else if (TryConsume('%'))
+                {
+                    var divisor = ParsePower();
+                    if (Math.Abs(divisor) < double.Epsilon)
+                        throw new DivideByZeroException("ColorCal expression takes a remainder by zero.");
+                    value = EnsureFinite(value % divisor);
+                }
+                else return value;
+            }
+        }
+
+        private double ParsePower()
+        {
+            var value = ParseUnary();
+            return TryConsume('^') ? EnsureFinite(Math.Pow(value, ParsePower())) : value;
+        }
+
+        private double ParseUnary()
+        {
+            if (TryConsume('+')) return ParseUnary();
+            if (TryConsume('-')) return EnsureFinite(-ParseUnary());
+            return ParsePrimary();
+        }
+
+        private double ParsePrimary()
+        {
+            if (TryConsume('('))
+            {
+                var value = ParseAdditive();
+                Expect(')');
+                return value;
+            }
+
+            SkipWhitespace();
+            if (_position >= _expression.Length)
+                throw Error("Expected a number, function, or parenthesized expression.");
+            if (char.IsDigit(_expression[_position]) || _expression[_position] == '.')
+                return ParseNumber();
+            if (char.IsLetter(_expression[_position]) || _expression[_position] == '_')
+                return ParseIdentifierOrFunction();
+            throw Error($"Unexpected token '{_expression[_position]}'.");
+        }
+
+        private double ParseIdentifierOrFunction()
+        {
+            int start = _position;
+            while (_position < _expression.Length &&
+                   (char.IsLetterOrDigit(_expression[_position]) || _expression[_position] is '_' or '.'))
+                _position++;
+            var name = _expression[start.._position];
+            if (name.Equals("true", StringComparison.OrdinalIgnoreCase)) return 1;
+            if (name.Equals("false", StringComparison.OrdinalIgnoreCase)) return 0;
+
+            Expect('(');
+            var arguments = new List<double>();
+            if (!Peek(')'))
+            {
+                do
+                {
+                    arguments.Add(ParseAdditive());
+                } while (TryConsume(','));
+            }
+            Expect(')');
+
+            return name.ToLowerInvariant() switch
+            {
+                "abs" or "math.abs" => ApplyUnary(name, arguments, Math.Abs),
+                "floor" or "math.floor" => ApplyUnary(name, arguments, Math.Floor),
+                "ceiling" or "math.ceiling" => ApplyUnary(name, arguments, Math.Ceiling),
+                "sqrt" or "math.sqrt" => ApplyUnary(name, arguments, Math.Sqrt),
+                "round" or "math.round" => ApplyRound(name, arguments),
+                "min" or "math.min" => ApplyBinary(name, arguments, Math.Min),
+                "max" or "math.max" => ApplyBinary(name, arguments, Math.Max),
+                _ => throw Error($"Unsupported function '{name}'.")
+            };
+        }
+
+        private double ParseNumber()
+        {
+            int start = _position;
+            while (_position < _expression.Length && char.IsDigit(_expression[_position])) _position++;
+            if (_position < _expression.Length && _expression[_position] == '.')
+            {
+                _position++;
+                while (_position < _expression.Length && char.IsDigit(_expression[_position])) _position++;
+            }
+            if (_position < _expression.Length && _expression[_position] is 'e' or 'E')
+            {
+                _position++;
+                if (_position < _expression.Length && _expression[_position] is '+' or '-') _position++;
+                int exponentStart = _position;
+                while (_position < _expression.Length && char.IsDigit(_expression[_position])) _position++;
+                if (exponentStart == _position)
+                    throw Error("A scientific-notation exponent requires digits.");
+            }
+
+            var token = _expression[start.._position];
+            if (!double.TryParse(token, System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out var value))
+                throw Error($"Invalid number '{token}'.");
+            return EnsureFinite(value);
+        }
+
+        private bool TryConsume(char expected)
+        {
+            SkipWhitespace();
+            if (_position >= _expression.Length || _expression[_position] != expected) return false;
+            _position++;
+            return true;
+        }
+
+        private bool Peek(char expected)
+        {
+            SkipWhitespace();
+            return _position < _expression.Length && _expression[_position] == expected;
+        }
+
+        private void Expect(char expected)
+        {
+            if (!TryConsume(expected))
+                throw Error($"Expected '{expected}'.");
+        }
+
+        private void SkipWhitespace()
+        {
+            while (_position < _expression.Length && char.IsWhiteSpace(_expression[_position]))
+                _position++;
+        }
+
+        private FormatException Error(string message) =>
+            new($"{message} Position {_position} in '{_expression}'.");
+
+        private static double EnsureFinite(double value)
+        {
+            if (!double.IsFinite(value))
+                throw new OverflowException("ColorCal expression produced a non-finite number.");
+            return value;
+        }
+
+        private static double ApplyUnary(string name, IReadOnlyList<double> arguments, Func<double, double> function)
+        {
+            if (arguments.Count != 1)
+                throw new FormatException($"Function '{name}' requires one argument.");
+            return EnsureFinite(function(arguments[0]));
+        }
+
+        private static double ApplyBinary(string name, IReadOnlyList<double> arguments, Func<double, double, double> function)
+        {
+            if (arguments.Count != 2)
+                throw new FormatException($"Function '{name}' requires two arguments.");
+            return EnsureFinite(function(arguments[0], arguments[1]));
+        }
+
+        private static double ApplyRound(string name, IReadOnlyList<double> arguments)
+        {
+            return arguments.Count switch
+            {
+                1 => EnsureFinite(Math.Round(arguments[0])),
+                2 => EnsureFinite(Math.Round(arguments[0], checked((int)arguments[1]))),
+                _ => throw new FormatException($"Function '{name}' requires one or two arguments.")
+            };
+        }
     }
 
     // ============ Break ============

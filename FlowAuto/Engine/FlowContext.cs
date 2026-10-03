@@ -2,9 +2,15 @@ namespace FlowAuto.Engine;
 
 public class FlowContext
 {
+    private readonly AsyncLocal<CancellationToken?> _activeCancellationToken = new();
+
     public Dictionary<string, object> Variables { get; } = new();
     public IntPtr CurrentHwnd { get; set; }
     public CancellationTokenSource? Cts { get; set; }
+    public CancellationToken FlowCancellationToken =>
+        Cts?.Token ?? System.Threading.CancellationToken.None;
+    public CancellationToken CancellationToken =>
+        _activeCancellationToken.Value ?? FlowCancellationToken;
     public TaskCompletionSource<bool>? PauseTcs { get; set; }
     public FlowLogger Logger { get; }
 
@@ -41,8 +47,33 @@ public class FlowContext
     /// </summary>
     public void CheckCancellation()
     {
-        if (Cts?.IsCancellationRequested == true)
-            throw new OperationCanceledException("Flow execution was stopped.");
+        CancellationToken.ThrowIfCancellationRequested();
+    }
+
+    /// <summary>
+    /// Apply a per-node timeout token to all asynchronous operations in the
+    /// current execution path without changing the flow-wide stop token.
+    /// </summary>
+    public IDisposable UseCancellationToken(CancellationToken cancellationToken)
+    {
+        var previous = _activeCancellationToken.Value;
+        _activeCancellationToken.Value = cancellationToken;
+        return new CancellationScope(_activeCancellationToken, previous);
+    }
+
+    /// <summary>
+    /// Delay while observing a user-requested stop. Centralizing delays keeps
+    /// retries, polling loops and pre/post action waits responsive.
+    /// </summary>
+    public Task DelayAsync(int milliseconds)
+    {
+        if (milliseconds <= 0)
+        {
+            CheckCancellation();
+            return Task.CompletedTask;
+        }
+
+        return Task.Delay(milliseconds, CancellationToken);
     }
 
     /// <summary>
@@ -54,9 +85,23 @@ public class FlowContext
         {
             CheckCancellation();
             if (PauseTcs != null)
-                await PauseTcs.Task;
+                await PauseTcs.Task.WaitAsync(CancellationToken);
             else
-                await Task.Delay(100);
+                await DelayAsync(100);
+        }
+    }
+
+    private sealed class CancellationScope(
+        AsyncLocal<CancellationToken?> target,
+        CancellationToken? previous) : IDisposable
+    {
+        private bool _disposed;
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            target.Value = previous;
+            _disposed = true;
         }
     }
 }

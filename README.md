@@ -166,6 +166,14 @@ dotnet publish FlowAuto\FlowAuto.csproj --configuration Release -o "..\publish" 
 
 > **Administrator privileges required** — the application uses a manifest to request elevation. Keyboard/mouse simulation and window control require admin rights.
 
+### Regression Tests
+
+The repository includes a dependency-free regression executable covering flow routing, Gate behavior, cancellation/timeouts, validation, HSV boundary matching, template cache refresh, and prepared-template performance.
+
+```powershell
+dotnet run --project FlowAuto.RegressionTests\FlowAuto.RegressionTests.csproj --configuration Release
+```
+
 ---
 
 ## Screenshots
